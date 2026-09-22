@@ -125,7 +125,7 @@ createUserRoute =
 
 
 
--- Handlers
+-- Route handlers
 
 
 getUserHandler : AppModel -> Request { id : Int } Helpers.EmptyRequestBody -> Task Error (Response GetUserResponse)

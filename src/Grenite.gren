@@ -1,12 +1,5 @@
 module Grenite exposing (Model, Msg, Server, createRoute, createServer)
 
-{-| A type-safe HTTP server framework for Node.js, powered by Gren.
-
-This is the Gren port of the camellia framework. It uses the built-in
-`HttpServer` of `gren-lang/node`, so it needs no JavaScript of its own.
-
--}
-
 import Array exposing (Array)
 import Bytes exposing (Bytes)
 import Grenite.Http
@@ -104,7 +97,7 @@ processRequest appModel { nodeRequest, params, requestBody, handler, responseEnc
 
 
 
--- Elm lifecycle types and functions
+-- Lifecycle types and functions
 
 
 type alias Model appModel appError =
@@ -119,7 +112,6 @@ type alias Model appModel appError =
 type Msg appError
     = CreateServerResult (Result HttpServer.ServerError HttpServer.Server)
     | OnRequest { request : HttpServer.Request, responseToken : HttpResponse.Response }
-    | RequestResult { responseToken : HttpResponse.Response, result : Result appError (Response String) }
 
 
 init : Application appModel appError -> Environment -> Init.Task { model : Model appModel appError, command : Cmd (Msg appError) }
@@ -177,20 +169,12 @@ update msg model =
                             Task.succeed (model.application.notFoundHandler nodeRequest)
             in
             { model = model
-            , command = appTask |> Task.attempt (\result -> RequestResult { responseToken = responseToken, result = result })
+            , command =
+                appTask
+                    |> Task.onError (\error -> Task.succeed (model.application.errorHandler error))
+                    |> Task.map (sendHttpResponse responseToken)
+                    |> Task.executeCmd
             }
-
-        RequestResult { responseToken = responseToken, result = result } ->
-            when result is
-                Ok response ->
-                    { model = model
-                    , command = sendHttpResponse responseToken response
-                    }
-
-                Err error ->
-                    { model = model
-                    , command = sendHttpResponse responseToken (model.application.errorHandler error)
-                    }
 
 
 subscriptions : Model appModel appError -> Sub (Msg appError)
