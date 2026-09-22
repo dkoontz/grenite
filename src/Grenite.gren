@@ -1,0 +1,267 @@
+module Grenite exposing (Model, Msg, Server, createRoute, createServer)
+
+{-| A type-safe HTTP server framework for Node.js, powered by Gren.
+
+This is the Gren port of the camellia framework. It uses the built-in
+`HttpServer` of `gren-lang/node`, so it needs no JavaScript of its own.
+
+-}
+
+import Array exposing (Array)
+import Bytes exposing (Bytes)
+import Grenite.Http
+import Grenite.Types exposing (Application, Request, Response, RouteConfig, RouteHandler(..))
+import HttpServer
+import HttpServer.Response as HttpResponse
+import Init
+import Json.Encode as Encode
+import Node exposing (Environment)
+import Stream
+import Task exposing (Task)
+
+
+type alias Server appModel appError =
+    Node.Program (Model appModel appError) (Msg appError)
+
+
+createServer : Application appModel appError -> Server appModel appError
+createServer application =
+    Node.defineProgram
+        { init = init application
+        , update = update
+        , subscriptions = subscriptions
+        }
+
+
+createRoute : RouteConfig appModel appError routeParams requestBody responseBody -> RouteHandler appModel appError
+createRoute config =
+    RouteHandler
+        { method = config.method
+        , matcher =
+            \appModel nodeRequest ->
+                if nodeRequest.method == config.method then
+                    when config.route nodeRequest.url.path is
+                        Nothing ->
+                            Nothing
+
+                        Just paramsResult ->
+                            when paramsResult is
+                                Err error ->
+                                    Just (Err error)
+
+                                Ok params ->
+                                    when HttpServer.bodyAsString nodeRequest is
+                                        Nothing ->
+                                            Just (Err "Request body is not valid UTF-8 text")
+
+                                        Just bodyString ->
+                                            when config.requestDecoder bodyString is
+                                                Ok requestBody ->
+                                                    Just
+                                                        (Ok
+                                                            (processRequest appModel
+                                                                { nodeRequest = nodeRequest
+                                                                , params = params
+                                                                , requestBody = requestBody
+                                                                , handler = config.handler
+                                                                , responseEncoder = config.responseEncoder
+                                                                }
+                                                            )
+                                                        )
+
+                                                Err decodeError ->
+                                                    Just (Err decodeError)
+
+                else
+                    Nothing
+        }
+
+
+processRequest :
+    appModel
+    ->
+        { nodeRequest : HttpServer.Request
+        , params : routeParams
+        , requestBody : requestBody
+        , handler : appModel -> Request routeParams requestBody -> Task appError (Response responseBody)
+        , responseEncoder : responseBody -> String
+        }
+    -> Task appError (Response String)
+processRequest appModel { nodeRequest, params, requestBody, handler, responseEncoder } =
+    handler appModel
+        { url = nodeRequest.url
+        , headers = Grenite.Http.parseRequestHeaders nodeRequest.headers
+        , params = params
+        , body = requestBody
+        }
+        |> Task.map
+            (\response ->
+                { status = response.status
+                , body = responseEncoder response.body
+                , headers = response.headers
+                }
+            )
+
+
+
+-- Elm lifecycle types and functions
+
+
+type alias Model appModel appError =
+    { application : Application appModel appError
+    , appModel : appModel
+    , server : Maybe HttpServer.Server
+    , stdout : Stream.Writable Bytes
+    , stderr : Stream.Writable Bytes
+    }
+
+
+type Msg appError
+    = CreateServerResult (Result HttpServer.ServerError HttpServer.Server)
+    | OnRequest { request : HttpServer.Request, responseToken : HttpResponse.Response }
+    | RequestResult { responseToken : HttpResponse.Response, result : Result appError (Response String) }
+
+
+init : Application appModel appError -> Environment -> Init.Task { model : Model appModel appError, command : Cmd (Msg appError) }
+init application env =
+    Init.await HttpServer.initialize
+        (\permission ->
+            Node.startProgram
+                { model =
+                    { application = application
+                    , appModel = application.init env
+                    , server = Nothing
+                    , stdout = env.stdout
+                    , stderr = env.stderr
+                    }
+                , command =
+                    HttpServer.createServer permission
+                        { host = application.host
+                        , port_ = application.port_
+                        }
+                        |> Task.attempt CreateServerResult
+                }
+        )
+
+
+update : Msg appError -> Model appModel appError -> { model : Model appModel appError, command : Cmd (Msg appError) }
+update msg model =
+    when msg is
+        CreateServerResult result ->
+            when result is
+                Ok server ->
+                    { model = { model | server = Just server }
+                    , command =
+                        logLine model.stdout
+                            ("Grenite server listening on http://" ++ model.application.host ++ ":" ++ String.fromInt model.application.port_)
+                            |> Task.execute
+                    }
+
+                Err (HttpServer.ServerError serverError) ->
+                    { model = model
+                    , command =
+                        logLine model.stderr
+                            ("Failed to start server: " ++ serverError.code ++ " " ++ serverError.message)
+                            |> Task.map (\_ -> Node.exitWithCode 1)
+                            |> Task.executeCmd
+                    }
+
+        OnRequest { request = nodeRequest, responseToken = responseToken } ->
+            let
+                appTask =
+                    when tryRoutes model.appModel nodeRequest model.application.routes is
+                        Just routeResponse ->
+                            routeResponse
+
+                        Nothing ->
+                            Task.succeed (model.application.notFoundHandler nodeRequest)
+            in
+            { model = model
+            , command = appTask |> Task.attempt (\result -> RequestResult { responseToken = responseToken, result = result })
+            }
+
+        RequestResult { responseToken = responseToken, result = result } ->
+            when result is
+                Ok response ->
+                    { model = model
+                    , command = sendHttpResponse responseToken response
+                    }
+
+                Err error ->
+                    { model = model
+                    , command = sendHttpResponse responseToken (model.application.errorHandler error)
+                    }
+
+
+subscriptions : Model appModel appError -> Sub (Msg appError)
+subscriptions model =
+    when model.server is
+        Just server ->
+            HttpServer.onRequest server (\request responseToken -> OnRequest { request = request, responseToken = responseToken })
+
+        Nothing ->
+            Sub.none
+
+
+
+-- Runner utilities
+
+
+sendHttpResponse : HttpResponse.Response -> Response String -> Cmd msg
+sendHttpResponse responseToken response =
+    response.headers
+        |> Array.foldl
+            (\header token ->
+                let
+                    headerPair =
+                        Grenite.Http.responseHeaderToPair header
+                in
+                HttpResponse.setHeader headerPair.key headerPair.value token
+            )
+            responseToken
+        |> HttpResponse.setStatus response.status
+        |> HttpResponse.setBody response.body
+        |> HttpResponse.send
+
+
+tryRoutes : appModel -> HttpServer.Request -> Array (RouteHandler appModel appError) -> Maybe (Task appError (Response String))
+tryRoutes appModel nodeRequest routes =
+    when Array.first routes is
+        Nothing ->
+            Nothing
+
+        Just (RouteHandler config) ->
+            if nodeRequest.method == config.method then
+                when config.matcher appModel nodeRequest is
+                    Just (Ok response) ->
+                        Just response
+
+                    Just (Err error) ->
+                        Just (Task.succeed (badRequestResponse error))
+
+                    Nothing ->
+                        tryRoutes appModel nodeRequest (Array.dropFirst 1 routes)
+
+            else
+                tryRoutes appModel nodeRequest (Array.dropFirst 1 routes)
+
+
+badRequestResponse : String -> Response String
+badRequestResponse errorMessage =
+    { status = 400
+    , body =
+        Encode.encode 0
+            (Encode.object
+                [ { key = "error", value = Encode.string "Bad Request" }
+                , { key = "message", value = Encode.string errorMessage }
+                ]
+            )
+    , headers = []
+    }
+
+
+logLine : Stream.Writable Bytes -> String -> Task error {}
+logLine stream message =
+    Stream.writeLineAsBytes message stream
+        |> Task.onError (\_ -> Task.succeed stream)
+        |> Task.map (\_ -> {})

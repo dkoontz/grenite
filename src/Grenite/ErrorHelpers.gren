@@ -1,0 +1,41 @@
+module Grenite.ErrorHelpers exposing (httpClientErrorToResponse)
+
+import Grenite.Types
+import HttpClient
+import Json.Encode as Encode
+
+
+httpClientErrorToResponse : HttpClient.Error -> Grenite.Types.Response String
+httpClientErrorToResponse httpError =
+    when httpError is
+        HttpClient.BadUrl url ->
+            errorResponse 400 "Bad Request" ("Invalid URL: " ++ url)
+
+        HttpClient.BadHeaders ->
+            errorResponse 400 "Bad Request" "The request headers are not valid"
+
+        HttpClient.BadStatus response ->
+            errorResponse response.statusCode "HTTP Error" ("Server returned status " ++ String.fromInt response.statusCode)
+
+        HttpClient.UnexpectedResponseBody message ->
+            errorResponse 502 "Bad Gateway" ("Invalid response body: " ++ message)
+
+        HttpClient.Timeout ->
+            errorResponse 504 "Gateway Timeout" "Request timed out"
+
+        HttpClient.UnknownError message ->
+            errorResponse 500 "Internal Server Error" message
+
+
+errorResponse : Int -> String -> String -> Grenite.Types.Response String
+errorResponse status error message =
+    { status = status
+    , body =
+        Encode.encode 0
+            (Encode.object
+                [ { key = "error", value = Encode.string error }
+                , { key = "message", value = Encode.string message }
+                ]
+            )
+    , headers = []
+    }

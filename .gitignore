@@ -1,0 +1,9 @@
+# Gren build caches
+gren_packages/
+.gren/
+
+# Compiled application output
+app
+examples/*/app
+*.js
+!*.cfg.js

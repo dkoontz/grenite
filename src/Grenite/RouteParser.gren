@@ -1,0 +1,137 @@
+module Grenite.RouteParser exposing (RouteParser, defineRoute, int, noParams, optional, required, string, succeed)
+
+import Array exposing (Array)
+import Dict exposing (Dict)
+
+
+type RouteParser a
+    = RouteParser (Dict String String -> Result String a)
+
+
+defineRoute : String -> RouteParser a -> String -> Maybe (Result String a)
+defineRoute routeDefinition parser path =
+    matchRoute routeDefinition path
+        |> Maybe.map (\params -> parse parser params)
+
+
+noParams : RouteParser {}
+noParams =
+    RouteParser (\_ -> Ok {})
+
+
+succeed : a -> RouteParser a
+succeed value =
+    RouteParser (\_ -> Ok value)
+
+
+required : String -> (String -> Result String a) -> RouteParser (a -> b) -> RouteParser b
+required paramName parser (RouteParser parserFn) =
+    RouteParser
+        (\dict ->
+            when Dict.get paramName dict is
+                Nothing ->
+                    Err ("Required parameter '" ++ paramName ++ "' was not found")
+
+                Just paramValue ->
+                    when parser paramValue is
+                        Err parseErr ->
+                            Err ("Parameter '" ++ paramName ++ "': " ++ parseErr)
+
+                        Ok parsedValue ->
+                            when parserFn dict is
+                                Err err ->
+                                    Err err
+
+                                Ok fn ->
+                                    Ok (fn parsedValue)
+        )
+
+
+optional : String -> (String -> Result String a) -> a -> RouteParser (a -> b) -> RouteParser b
+optional paramName parser defaultValue (RouteParser parserFn) =
+    RouteParser
+        (\dict ->
+            let
+                parsedValue =
+                    when Dict.get paramName dict is
+                        Nothing ->
+                            Ok defaultValue
+
+                        Just paramValue ->
+                            parser paramValue
+            in
+            when parsedValue is
+                Err err ->
+                    Err err
+
+                Ok value ->
+                    when parserFn dict is
+                        Err err ->
+                            Err err
+
+                        Ok fn ->
+                            Ok (fn value)
+        )
+
+
+parse : RouteParser a -> Dict String String -> Result String a
+parse (RouteParser parserFn) dict =
+    parserFn dict
+
+
+
+-- Helper parsers for common types
+
+
+int : String -> Result String Int
+int str =
+    when String.toInt str is
+        Just value ->
+            Ok value
+
+        Nothing ->
+            Err ("could not convert string '" ++ str ++ "' to an Int")
+
+
+string : String -> Result String String
+string str =
+    Ok str
+
+
+matchRoute : String -> String -> Maybe (Dict String String)
+matchRoute routeDefinition path =
+    let
+        pathParts =
+            path
+                |> String.split "/"
+                |> Array.keepIf (\part -> part /= "")
+
+        routeDefinitionParts =
+            routeDefinition
+                |> String.split "/"
+                |> Array.keepIf (\part -> part /= "")
+    in
+    if Array.length pathParts /= Array.length routeDefinitionParts then
+        Nothing
+
+    else
+        Array.map2 (\pathPart routePart -> { pathPart = pathPart, routePart = routePart })
+            pathParts
+            routeDefinitionParts
+            |> Array.foldl
+                (\pair maybeDict ->
+                    when maybeDict is
+                        Nothing ->
+                            Nothing
+
+                        Just dict ->
+                            if String.startsWith ":" pair.routePart then
+                                Just (Dict.set (String.dropFirst 1 pair.routePart) pair.pathPart dict)
+
+                            else if pair.pathPart == pair.routePart then
+                                Just dict
+
+                            else
+                                Nothing
+                )
+                (Just Dict.empty)

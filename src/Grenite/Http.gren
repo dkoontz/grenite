@@ -1,0 +1,1249 @@
+module Grenite.Http exposing
+    ( AccessControlAllowOrigin(..)
+    , AuthorizationType(..)
+    , CacheDirective(..)
+    , ConnectionType(..)
+    , ContentDisposition(..)
+    , Encoding(..)
+    , MimeType(..)
+    , RequestHeader(..)
+    , ResponseHeader(..)
+    , RetryAfter(..)
+    , StrictTransportSecurity(..)
+    , XFrameOptions(..)
+    , formatImfFixdate
+    , parseAuthorization
+    , parseCacheDirective
+    , parseConnectionType
+    , parseEncoding
+    , parseImfFixdate
+    , parseMimeType
+    , parseRequestHeaders
+    , responseHeaderToPair
+    )
+
+{-| Typed HTTP header vocabulary.
+
+Incoming headers arrive from `gren-lang/node` as a `Dict String String`.
+Use `parseRequestHeaders` to turn that dict into typed request headers.
+Use `responseHeaderToPair` to turn a typed response header into the
+key-value pair that `HttpServer.Response.setHeader` expects.
+
+-}
+
+import Array exposing (Array)
+import Dict exposing (Dict)
+import HttpServer
+import Result exposing (Result)
+import Time
+
+
+type MimeType
+    = ApplicationFormUrlEncoded
+    | ApplicationJson
+    | ApplicationOctetStream
+    | ApplicationPdf
+    | ApplicationZip
+    | AudioMp3
+    | AudioWebm
+    | CustomMime String
+    | ImageAvif
+    | ImageGif
+    | ImageJpeg
+    | ImagePng
+    | ImageSvg
+    | ImageWebp
+    | MultipartFormData
+    | TextCss
+    | TextHtml
+    | TextJavascript
+    | TextPlain
+    | VideoMp4
+    | VideoWebm
+
+
+type Encoding
+    = Br
+    | Deflate
+    | Gzip
+    | Identity
+    | Star
+    | Zstd
+
+
+type CacheDirective
+    = MaxAge Int
+    | SMaxAge Int
+    | MustRevalidate
+    | ProxyRevalidate
+    | NoCache
+    | NoStore
+    | Private
+    | Public
+    | MustUnderstand
+    | NoTransform
+    | Immutable
+    | StaleWhileRevalidate Int
+    | StaleIfError Int
+
+
+type ConnectionType
+    = Close
+    | KeepAlive
+    | Upgrade
+
+
+type AuthorizationType
+    = Basic String
+    | Bearer String
+    | CustomAuth { scheme : String, credentials : String }
+
+
+type AccessControlAllowOrigin
+    = Wildcard
+
+
+type ContentDisposition
+    = Inline (Maybe String)
+    | Attachment (Maybe String)
+    | FormData { name : String, filename : Maybe String }
+
+
+type XFrameOptions
+    = Deny
+    | SameOrigin
+
+
+type RetryAfter
+    = Seconds Int
+    | HttpDate Time.Posix
+
+
+type StrictTransportSecurity
+    = StrictTransportSecurity { maxAge : Int, includeSubDomains : Bool, preload : Bool }
+
+
+
+-- Implemented based on:
+--   https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/MIME_types
+--   https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Content_negotiation/List_of_default_Accept_values
+
+
+type RequestHeader
+    = RequestAccept (Array { mimeType : MimeType, preference : Float })
+    | RequestAcceptEncoding (Array { encoding : Encoding, preference : Float })
+    | RequestAcceptLanguage (Array { language : String, preference : Float })
+    | RequestAuthorization AuthorizationType
+    | RequestCacheControl (Array CacheDirective)
+    | RequestConnection ConnectionType
+    | RequestContentEncoding Encoding
+    | RequestContentLanguage String
+    | RequestContentLength Int
+    | RequestContentType MimeType
+    | RequestCookie (Array { name : String, value : String })
+    | RequestCustomHeader { name : String, value : String }
+    | RequestHost String
+    | RequestIfMatch String
+    | RequestIfModifiedSince String
+    | RequestIfNoneMatch String
+    | RequestIfRange String
+    | RequestIfUnmodifiedSince String
+    | RequestOrigin String
+    | RequestReferrer String
+    | RequestUserAgent String
+
+
+
+-- https://flaviocopes.com/http-response-headers/
+
+
+type ResponseHeader
+    = ResponseAccessControlAllowOrigin AccessControlAllowOrigin
+    | ResponseAccessControlAllowCredentials Bool
+    | ResponseAccessControlExposeHeaders (Array String)
+    | ResponseAccessControlMaxAge Int
+    | ResponseAccessControlAllowMethods (Array HttpServer.Method)
+    | ResponseAccessControlAllowHeaders (Array String)
+    | ResponseAllow (Array HttpServer.Method)
+    | ResponseCacheControl (Array CacheDirective)
+    | ResponseContentDisposition ContentDisposition
+    | ResponseContentEncoding Encoding
+    | ResponseContentLanguage String
+    | ResponseContentLength Int
+    | ResponseContentType MimeType
+    | ResponseCustomHeader { name : String, value : String }
+    | ResponseETag String
+    | ResponseExpires Time.Posix
+    | ResponseLastModified Time.Posix
+    | ResponseLocation String
+    | ResponseRetryAfter RetryAfter
+    | ResponseServer String
+    | ResponseSetCookie (Array { name : String, value : String })
+    | ResponseStrictTransportSecurity StrictTransportSecurity
+    | ResponseXFrameOptions XFrameOptions
+
+
+responseHeaderToPair : ResponseHeader -> { key : String, value : String }
+responseHeaderToPair header =
+    when header is
+        ResponseAccessControlAllowOrigin origin ->
+            pair "Access-Control-Allow-Origin" (accessControlAllowOriginToString origin)
+
+        ResponseAccessControlAllowCredentials bool ->
+            pair "Access-Control-Allow-Credentials"
+                (if bool then
+                    "true"
+
+                 else
+                    "false"
+                )
+
+        ResponseAccessControlExposeHeaders headers ->
+            pair "Access-Control-Expose-Headers" (String.join ", " headers)
+
+        ResponseAccessControlMaxAge seconds ->
+            pair "Access-Control-Max-Age" (String.fromInt seconds)
+
+        ResponseAccessControlAllowMethods methods ->
+            pair "Access-Control-Allow-Methods" (methodListToString methods)
+
+        ResponseAccessControlAllowHeaders headers ->
+            pair "Access-Control-Allow-Headers" (String.join ", " headers)
+
+        ResponseAllow methods ->
+            pair "Allow" (methodListToString methods)
+
+        ResponseCacheControl directives ->
+            pair "Cache-Control" (cacheDirectiveListToString directives)
+
+        ResponseContentDisposition disposition ->
+            pair "Content-Disposition" (contentDispositionToString disposition)
+
+        ResponseContentEncoding encoding ->
+            pair "Content-Encoding" (encodingToString encoding)
+
+        ResponseContentLanguage language ->
+            pair "Content-Language" language
+
+        ResponseContentLength length ->
+            pair "Content-Length" (String.fromInt length)
+
+        ResponseContentType mimeType ->
+            pair "Content-Type" (mimeTypeToString mimeType)
+
+        ResponseCustomHeader custom ->
+            pair custom.name custom.value
+
+        ResponseETag etag ->
+            pair "ETag" etag
+
+        ResponseExpires posix ->
+            pair "Expires" (formatImfFixdate posix)
+
+        ResponseLastModified posix ->
+            pair "Last-Modified" (formatImfFixdate posix)
+
+        ResponseLocation location ->
+            pair "Location" location
+
+        ResponseRetryAfter retry ->
+            pair "Retry-After" (retryAfterToString retry)
+
+        ResponseServer server ->
+            pair "Server" server
+
+        ResponseSetCookie cookies ->
+            pair "Set-Cookie" (String.join "; " (Array.map cookieToString cookies))
+
+        ResponseStrictTransportSecurity hsts ->
+            pair "Strict-Transport-Security" (strictTransportSecurityToString hsts)
+
+        ResponseXFrameOptions option ->
+            pair "X-Frame-Options" (xFrameOptionsToString option)
+
+
+pair : String -> String -> { key : String, value : String }
+pair key value =
+    { key = key, value = value }
+
+
+
+-- Incoming header parsing
+
+
+{-| Parse the raw header dict of an incoming request into typed headers.
+
+Unknown header names become `RequestCustomHeader`. A known header name with a
+value that fails to parse also becomes `RequestCustomHeader`, so one malformed
+header never rejects the whole request.
+
+-}
+parseRequestHeaders : Dict String String -> Array RequestHeader
+parseRequestHeaders headers =
+    Dict.foldl
+        (\name value acc ->
+            Array.pushLast (parseRequestHeader (String.toLower name) value) acc
+        )
+        []
+        headers
+
+
+parseRequestHeader : String -> String -> RequestHeader
+parseRequestHeader lowercaseName value =
+    let
+        fallback =
+            RequestCustomHeader { name = lowercaseName, value = value }
+    in
+    when lowercaseName is
+        "accept" ->
+            when parseQualityList (Just << parseMimeType) (\mimeType preference -> { mimeType = mimeType, preference = preference }) value is
+                Ok list ->
+                    RequestAccept list
+
+                Err _ ->
+                    fallback
+
+        "accept-encoding" ->
+            when parseQualityList (Result.toMaybe << parseEncoding) (\encoding preference -> { encoding = encoding, preference = preference }) value is
+                Ok list ->
+                    RequestAcceptEncoding list
+
+                Err _ ->
+                    fallback
+
+        "accept-language" ->
+            when parseQualityList Just (\language preference -> { language = language, preference = preference }) value is
+                Ok list ->
+                    RequestAcceptLanguage list
+
+                Err _ ->
+                    fallback
+
+        "authorization" ->
+            when parseAuthorization value is
+                Ok auth ->
+                    RequestAuthorization auth
+
+                Err _ ->
+                    fallback
+
+        "cache-control" ->
+            RequestCacheControl
+                (value
+                    |> String.split ","
+                    |> Array.map String.trim
+                    |> Array.mapAndKeepJust
+                        (\directive ->
+                            when parseCacheDirective directive is
+                                Ok parsed ->
+                                    Just parsed
+
+                                Err _ ->
+                                    Nothing
+                        )
+                )
+
+        "connection" ->
+            when parseConnectionType value is
+                Ok conn ->
+                    RequestConnection conn
+
+                Err _ ->
+                    fallback
+
+        "content-encoding" ->
+            when parseEncoding value is
+                Ok encoding ->
+                    RequestContentEncoding encoding
+
+                Err _ ->
+                    fallback
+
+        "content-language" ->
+            RequestContentLanguage value
+
+        "content-length" ->
+            when String.toInt value is
+                Just length ->
+                    RequestContentLength length
+
+                Nothing ->
+                    fallback
+
+        "content-type" ->
+            RequestContentType (parseMimeType value)
+
+        "cookie" ->
+            RequestCookie (parseCookies value)
+
+        "host" ->
+            RequestHost value
+
+        "if-modified-since" ->
+            RequestIfModifiedSince value
+
+        "if-none-match" ->
+            RequestIfNoneMatch value
+
+        "origin" ->
+            RequestOrigin value
+
+        "referer" ->
+            RequestReferrer value
+
+        "referrer" ->
+            RequestReferrer value
+
+        "user-agent" ->
+            RequestUserAgent value
+
+        _ ->
+            fallback
+
+
+parseCookies : String -> Array { name : String, value : String }
+parseCookies value =
+    value
+        |> String.split ";"
+        |> Array.map String.trim
+        |> Array.mapAndKeepJust parseCookie
+
+
+parseCookie : String -> Maybe { name : String, value : String }
+parseCookie cookieStr =
+    let
+        parts =
+            String.split "=" cookieStr
+    in
+    when Array.first parts is
+        Just name ->
+            Just
+                { name = String.trim name
+                , value =
+                    parts
+                        |> Array.dropFirst 1
+                        |> String.join "="
+                }
+
+        Nothing ->
+            Nothing
+
+
+
+-- Value parsers
+
+
+parseMimeType : String -> MimeType
+parseMimeType str =
+    when str is
+        "application/x-www-form-urlencoded" ->
+            ApplicationFormUrlEncoded
+
+        "application/json" ->
+            ApplicationJson
+
+        "application/octet-stream" ->
+            ApplicationOctetStream
+
+        "application/pdf" ->
+            ApplicationPdf
+
+        "application/zip" ->
+            ApplicationZip
+
+        "audio/mpeg" ->
+            AudioMp3
+
+        "audio/webm" ->
+            AudioWebm
+
+        "image/avif" ->
+            ImageAvif
+
+        "image/gif" ->
+            ImageGif
+
+        "image/jpeg" ->
+            ImageJpeg
+
+        "image/png" ->
+            ImagePng
+
+        "image/svg+xml" ->
+            ImageSvg
+
+        "image/webp" ->
+            ImageWebp
+
+        "multipart/form-data" ->
+            MultipartFormData
+
+        "text/css" ->
+            TextCss
+
+        "text/html" ->
+            TextHtml
+
+        "text/javascript" ->
+            TextJavascript
+
+        "text/plain" ->
+            TextPlain
+
+        "video/mp4" ->
+            VideoMp4
+
+        "video/webm" ->
+            VideoWebm
+
+        _ ->
+            CustomMime str
+
+
+parseEncoding : String -> Result String Encoding
+parseEncoding str =
+    when str is
+        "br" ->
+            Ok Br
+
+        "deflate" ->
+            Ok Deflate
+
+        "gzip" ->
+            Ok Gzip
+
+        "identity" ->
+            Ok Identity
+
+        "*" ->
+            Ok Star
+
+        "zstd" ->
+            Ok Zstd
+
+        _ ->
+            Err ("Unknown encoding: " ++ str)
+
+
+parseConnectionType : String -> Result String ConnectionType
+parseConnectionType str =
+    when String.toLower str is
+        "close" ->
+            Ok Close
+
+        "keep-alive" ->
+            Ok KeepAlive
+
+        "upgrade" ->
+            Ok Upgrade
+
+        _ ->
+            Err ("Unknown connection type: " ++ str)
+
+
+parseAuthorization : String -> Result String AuthorizationType
+parseAuthorization str =
+    let
+        parts =
+            String.split " " str
+
+        rest =
+            parts
+                |> Array.dropFirst 1
+                |> String.join " "
+    in
+    when Array.first parts is
+        Just "Basic" ->
+            Ok (Basic rest)
+
+        Just "Bearer" ->
+            Ok (Bearer rest)
+
+        Just scheme ->
+            Ok (CustomAuth { scheme = scheme, credentials = rest })
+
+        Nothing ->
+            Err "Empty authorization header"
+
+
+parseCacheDirective : String -> Result String CacheDirective
+parseCacheDirective str =
+    if String.startsWith "max-age=" str then
+        when String.toInt (String.dropFirst 8 str) is
+            Just age ->
+                Ok (MaxAge age)
+
+            Nothing ->
+                Err ("Invalid max-age value: " ++ str)
+
+    else if String.startsWith "s-maxage=" str then
+        when String.toInt (String.dropFirst 9 str) is
+            Just age ->
+                Ok (SMaxAge age)
+
+            Nothing ->
+                Err ("Invalid s-maxage value: " ++ str)
+
+    else if String.startsWith "stale-while-revalidate=" str then
+        when String.toInt (String.dropFirst 23 str) is
+            Just age ->
+                Ok (StaleWhileRevalidate age)
+
+            Nothing ->
+                Err ("Invalid stale-while-revalidate value: " ++ str)
+
+    else if String.startsWith "stale-if-error=" str then
+        when String.toInt (String.dropFirst 15 str) is
+            Just age ->
+                Ok (StaleIfError age)
+
+            Nothing ->
+                Err ("Invalid stale-if-error value: " ++ str)
+
+    else
+        when str is
+            "must-revalidate" ->
+                Ok MustRevalidate
+
+            "proxy-revalidate" ->
+                Ok ProxyRevalidate
+
+            "no-cache" ->
+                Ok NoCache
+
+            "no-store" ->
+                Ok NoStore
+
+            "private" ->
+                Ok Private
+
+            "public" ->
+                Ok Public
+
+            "must-understand" ->
+                Ok MustUnderstand
+
+            "no-transform" ->
+                Ok NoTransform
+
+            "immutable" ->
+                Ok Immutable
+
+            _ ->
+                Err ("Unknown cache directive: " ++ str)
+
+
+
+-- Quality value lists (Accept, Accept-Encoding, Accept-Language)
+
+
+parseQualityList : (String -> Maybe a) -> (a -> Float -> b) -> String -> Result String (Array b)
+parseQualityList itemParser constructor str =
+    str
+        |> String.split ","
+        |> Array.map String.trim
+        |> Array.keepIf (\item -> not (String.isEmpty item))
+        |> Array.map (parseItemWithQualityValue itemParser constructor)
+        |> collectResults
+
+
+parseItemWithQualityValue : (String -> Maybe a) -> (a -> Float -> b) -> String -> Result String b
+parseItemWithQualityValue itemParser constructor itemStr =
+    let
+        parts =
+            String.split ";" itemStr
+
+        mainPart =
+            Maybe.withDefault "" (Array.first parts)
+
+        qValue =
+            parts
+                |> Array.dropFirst 1
+                |> Array.mapAndKeepJust
+                    (\part ->
+                        let
+                            trimmed =
+                                String.trim part
+                        in
+                        if String.startsWith "q=" trimmed then
+                            String.toFloat (String.dropFirst 2 trimmed)
+
+                        else
+                            Nothing
+                    )
+                |> Array.first
+                |> Maybe.withDefault 1.0
+    in
+    when itemParser mainPart is
+        Just parsedItem ->
+            Ok (constructor parsedItem qValue)
+
+        Nothing ->
+            Err ("Failed to parse: " ++ itemStr)
+
+
+collectResults : Array (Result e a) -> Result e (Array a)
+collectResults results =
+    Array.foldl
+        (\result acc ->
+            when acc is
+                Err err ->
+                    Err err
+
+                Ok list ->
+                    when result is
+                        Ok item ->
+                            Ok (Array.pushLast item list)
+
+                        Err err ->
+                            Err err
+        )
+        (Ok [])
+        results
+
+
+
+-- Formatting helpers
+
+
+methodListToString : Array HttpServer.Method -> String
+methodListToString methods =
+    methods
+        |> Array.map HttpServer.methodToString
+        |> String.join ", "
+
+
+mimeTypeToString : MimeType -> String
+mimeTypeToString mimeType =
+    when mimeType is
+        ApplicationFormUrlEncoded ->
+            "application/x-www-form-urlencoded"
+
+        ApplicationJson ->
+            "application/json"
+
+        ApplicationOctetStream ->
+            "application/octet-stream"
+
+        ApplicationPdf ->
+            "application/pdf"
+
+        ApplicationZip ->
+            "application/zip"
+
+        AudioMp3 ->
+            "audio/mpeg"
+
+        AudioWebm ->
+            "audio/webm"
+
+        CustomMime str ->
+            str
+
+        ImageAvif ->
+            "image/avif"
+
+        ImageGif ->
+            "image/gif"
+
+        ImageJpeg ->
+            "image/jpeg"
+
+        ImagePng ->
+            "image/png"
+
+        ImageSvg ->
+            "image/svg+xml"
+
+        ImageWebp ->
+            "image/webp"
+
+        MultipartFormData ->
+            "multipart/form-data"
+
+        TextCss ->
+            "text/css"
+
+        TextHtml ->
+            "text/html"
+
+        TextJavascript ->
+            "text/javascript"
+
+        TextPlain ->
+            "text/plain"
+
+        VideoMp4 ->
+            "video/mp4"
+
+        VideoWebm ->
+            "video/webm"
+
+
+encodingToString : Encoding -> String
+encodingToString encoding =
+    when encoding is
+        Br ->
+            "br"
+
+        Deflate ->
+            "deflate"
+
+        Gzip ->
+            "gzip"
+
+        Identity ->
+            "identity"
+
+        Star ->
+            "*"
+
+        Zstd ->
+            "zstd"
+
+
+cacheDirectiveToString : CacheDirective -> String
+cacheDirectiveToString directive =
+    when directive is
+        MaxAge age ->
+            "max-age=" ++ String.fromInt age
+
+        SMaxAge age ->
+            "s-maxage=" ++ String.fromInt age
+
+        MustRevalidate ->
+            "must-revalidate"
+
+        ProxyRevalidate ->
+            "proxy-revalidate"
+
+        NoCache ->
+            "no-cache"
+
+        NoStore ->
+            "no-store"
+
+        Private ->
+            "private"
+
+        Public ->
+            "public"
+
+        MustUnderstand ->
+            "must-understand"
+
+        NoTransform ->
+            "no-transform"
+
+        Immutable ->
+            "immutable"
+
+        StaleWhileRevalidate age ->
+            "stale-while-revalidate=" ++ String.fromInt age
+
+        StaleIfError age ->
+            "stale-if-error=" ++ String.fromInt age
+
+
+cacheDirectiveListToString : Array CacheDirective -> String
+cacheDirectiveListToString directives =
+    directives
+        |> Array.map cacheDirectiveToString
+        |> String.join ", "
+
+
+contentDispositionToString : ContentDisposition -> String
+contentDispositionToString disposition =
+    when disposition is
+        Inline maybeFilename ->
+            when maybeFilename is
+                Nothing ->
+                    "inline"
+
+                Just filename ->
+                    "inline; filename=\"" ++ filename ++ "\""
+
+        Attachment maybeFilename ->
+            when maybeFilename is
+                Nothing ->
+                    "attachment"
+
+                Just filename ->
+                    "attachment; filename=\"" ++ filename ++ "\""
+
+        FormData { name, filename } ->
+            when filename is
+                Nothing ->
+                    "form-data; name=\"" ++ name ++ "\""
+
+                Just f ->
+                    "form-data; name=\"" ++ name ++ "\"; filename=\"" ++ f ++ "\""
+
+
+accessControlAllowOriginToString : AccessControlAllowOrigin -> String
+accessControlAllowOriginToString origin =
+    when origin is
+        Wildcard ->
+            "*"
+
+
+xFrameOptionsToString : XFrameOptions -> String
+xFrameOptionsToString option =
+    when option is
+        Deny ->
+            "DENY"
+
+        SameOrigin ->
+            "SAMEORIGIN"
+
+
+retryAfterToString : RetryAfter -> String
+retryAfterToString retry =
+    when retry is
+        Seconds seconds ->
+            String.fromInt seconds
+
+        HttpDate posix ->
+            formatImfFixdate posix
+
+
+strictTransportSecurityToString : StrictTransportSecurity -> String
+strictTransportSecurityToString (StrictTransportSecurity config) =
+    let
+        baseDirective =
+            "max-age=" ++ String.fromInt config.maxAge
+
+        withSubDomains =
+            if config.includeSubDomains then
+                baseDirective ++ "; includeSubDomains"
+
+            else
+                baseDirective
+
+        withPreload =
+            if config.preload then
+                withSubDomains ++ "; preload"
+
+            else
+                withSubDomains
+    in
+    withPreload
+
+
+cookieToString : { name : String, value : String } -> String
+cookieToString cookie =
+    cookie.name ++ "=" ++ cookie.value
+
+
+
+-- IMF-fixdate (HTTP date) parsing and formatting
+
+
+{-| Parse an IMF-fixdate string, such as `Tue, 15 Nov 1994 08:12:31 GMT`.
+-}
+parseImfFixdate : String -> Result String Time.Posix
+parseImfFixdate str =
+    let
+        parts =
+            String.split " " str
+
+        part index =
+            Maybe.withDefault "" (Array.get index parts)
+    in
+    if Array.length parts /= 6 then
+        Err "Invalid IMF-fixdate format. Expected: 'Day, DD Mon YYYY HH:MM:SS GMT'"
+
+    else if part 5 /= "GMT" then
+        Err "Timezone must be GMT"
+
+    else
+        when dayNameToInt (String.dropLast 1 (part 0)) is
+            Err dayErr ->
+                Err dayErr
+
+            Ok _ ->
+                when String.toInt (part 1) is
+                    Nothing ->
+                        Err "Invalid day number"
+
+                    Just day ->
+                        when monthNameToInt (part 2) is
+                            Err monthErr ->
+                                Err monthErr
+
+                            Ok month ->
+                                when String.toInt (part 3) is
+                                    Nothing ->
+                                        Err "Invalid year number"
+
+                                    Just year ->
+                                        when parseTimePart (part 4) is
+                                            Err timeErr ->
+                                                Err timeErr
+
+                                            Ok time ->
+                                                if day >= 1 && day <= 31 && year >= 1970 then
+                                                    if day <= daysInMonth month year then
+                                                        Ok
+                                                            (Time.millisToPosix
+                                                                (toEpochMillis
+                                                                    { year = year
+                                                                    , month = month
+                                                                    , day = day
+                                                                    , hour = time.hour
+                                                                    , minute = time.minute
+                                                                    , second = time.second
+                                                                    }
+                                                                )
+                                                            )
+
+                                                    else
+                                                        Err "Day is invalid for the given month and year"
+
+                                                else
+                                                    Err "Invalid day or year"
+
+
+parseTimePart : String -> Result String { hour : Int, minute : Int, second : Int }
+parseTimePart timePart =
+    let
+        parts =
+            String.split ":" timePart
+
+        part index =
+            Maybe.withDefault "" (Array.get index parts)
+    in
+    if Array.length parts /= 3 then
+        Err "Time must be in HH:MM:SS format"
+
+    else
+        when Maybe.map3 (\hour minute second -> { hour = hour, minute = minute, second = second }) (String.toInt (part 0)) (String.toInt (part 1)) (String.toInt (part 2)) is
+            Nothing ->
+                Err "Invalid time format"
+
+            Just time ->
+                if time.hour >= 0 && time.hour <= 23 && time.minute >= 0 && time.minute <= 59 && time.second >= 0 && time.second <= 60 then
+                    Ok time
+
+                else
+                    Err "Time values out of range"
+
+
+dayNameToInt : String -> Result String Int
+dayNameToInt dayName =
+    when dayName is
+        "Mon" ->
+            Ok 1
+
+        "Tue" ->
+            Ok 2
+
+        "Wed" ->
+            Ok 3
+
+        "Thu" ->
+            Ok 4
+
+        "Fri" ->
+            Ok 5
+
+        "Sat" ->
+            Ok 6
+
+        "Sun" ->
+            Ok 7
+
+        _ ->
+            Err ("Invalid day name: " ++ dayName)
+
+
+monthNameToInt : String -> Result String Int
+monthNameToInt monthName =
+    when monthName is
+        "Jan" ->
+            Ok 1
+
+        "Feb" ->
+            Ok 2
+
+        "Mar" ->
+            Ok 3
+
+        "Apr" ->
+            Ok 4
+
+        "May" ->
+            Ok 5
+
+        "Jun" ->
+            Ok 6
+
+        "Jul" ->
+            Ok 7
+
+        "Aug" ->
+            Ok 8
+
+        "Sep" ->
+            Ok 9
+
+        "Oct" ->
+            Ok 10
+
+        "Nov" ->
+            Ok 11
+
+        "Dec" ->
+            Ok 12
+
+        _ ->
+            Err ("Invalid month name: " ++ monthName)
+
+
+divisibleBy : Int -> Int -> Bool
+divisibleBy divisor value =
+    value // divisor * divisor == value
+
+
+daysInMonth : Int -> Int -> Int
+daysInMonth month year =
+    when month is
+        2 ->
+            if divisibleBy 4 year && (not (divisibleBy 100 year) || divisibleBy 400 year) then
+                29
+
+            else
+                28
+
+        4 ->
+            30
+
+        6 ->
+            30
+
+        9 ->
+            30
+
+        11 ->
+            30
+
+        _ ->
+            31
+
+
+toEpochMillis : { year : Int, month : Int, day : Int, hour : Int, minute : Int, second : Int } -> Int
+toEpochMillis date =
+    let
+        yearsSince1970 =
+            date.year - 1970
+
+        leapDays =
+            (date.year - 1 - 1968) // 4 - (date.year - 1 - 1900) // 100 + (date.year - 1 - 1600) // 400
+
+        daysFromYears =
+            yearsSince1970 * 365 + leapDays - ((1970 - 1 - 1968) // 4 - (1970 - 1 - 1900) // 100 + (1970 - 1 - 1600) // 400)
+
+        daysFromMonths =
+            Array.range 1 (date.month - 1)
+                |> Array.map (\month -> daysInMonth month date.year)
+                |> Array.foldl (+) 0
+
+        daysSinceEpoch =
+            daysFromYears + daysFromMonths + (date.day - 1)
+    in
+    daysSinceEpoch * 24 * 60 * 60 * 1000
+        + date.hour * 60 * 60 * 1000
+        + date.minute * 60 * 1000
+        + date.second * 1000
+
+
+{-| Format a `Time.Posix` value as an IMF-fixdate string, such as `Tue, 15 Nov 1994 08:12:31 GMT`.
+-}
+formatImfFixdate : Time.Posix -> String
+formatImfFixdate posix =
+    let
+        utc =
+            Time.utc
+
+        weekdayToString weekday =
+            when weekday is
+                Time.Mon ->
+                    "Mon"
+
+                Time.Tue ->
+                    "Tue"
+
+                Time.Wed ->
+                    "Wed"
+
+                Time.Thu ->
+                    "Thu"
+
+                Time.Fri ->
+                    "Fri"
+
+                Time.Sat ->
+                    "Sat"
+
+                Time.Sun ->
+                    "Sun"
+
+        monthToString month =
+            when month is
+                Time.Jan ->
+                    "Jan"
+
+                Time.Feb ->
+                    "Feb"
+
+                Time.Mar ->
+                    "Mar"
+
+                Time.Apr ->
+                    "Apr"
+
+                Time.May ->
+                    "May"
+
+                Time.Jun ->
+                    "Jun"
+
+                Time.Jul ->
+                    "Jul"
+
+                Time.Aug ->
+                    "Aug"
+
+                Time.Sep ->
+                    "Sep"
+
+                Time.Oct ->
+                    "Oct"
+
+                Time.Nov ->
+                    "Nov"
+
+                Time.Dec ->
+                    "Dec"
+
+        padZero n =
+            if n < 10 then
+                "0" ++ String.fromInt n
+
+            else
+                String.fromInt n
+    in
+    weekdayToString (Time.toWeekday utc posix)
+        ++ ", "
+        ++ padZero (Time.toDay utc posix)
+        ++ " "
+        ++ monthToString (Time.toMonth utc posix)
+        ++ " "
+        ++ String.fromInt (Time.toYear utc posix)
+        ++ " "
+        ++ padZero (Time.toHour utc posix)
+        ++ ":"
+        ++ padZero (Time.toMinute utc posix)
+        ++ ":"
+        ++ padZero (Time.toSecond utc posix)
+        ++ " GMT"

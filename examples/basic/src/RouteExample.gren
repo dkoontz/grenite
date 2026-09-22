@@ -1,0 +1,219 @@
+module RouteExample exposing (AppModel, Error, application)
+
+import Grenite
+import Grenite.ErrorHelpers
+import Grenite.Helpers as Helpers
+import Grenite.Http as Http
+import Grenite.RouteParser as RouteParser
+import Grenite.Types exposing (Application, Request, Response, RouteHandler)
+import HttpClient
+import HttpServer
+import Json.Decode as Decode
+import Json.Encode as Encode
+import Task exposing (Task)
+
+
+application : Application AppModel Error
+application =
+    { host = "0.0.0.0"
+    , port_ = 8000
+    , routes = [ getUserRoute, getPostRoute, createUserRoute ]
+    , notFoundHandler = handleNotFound
+    , errorHandler = handleError
+    , init = \_ -> {}
+    }
+
+
+type alias AppModel =
+    {}
+
+
+type Error
+    = Http HttpClient.Error
+    | ValidationError String
+
+
+
+-- Example types for a user API
+
+
+type alias GetUserResponse =
+    { id : Int
+    , firstName : String
+    , lastName : String
+    , email : String
+    }
+
+
+type alias CreateUserRequest =
+    { firstName : String
+    , lastName : String
+    , email : String
+    }
+
+
+
+-- JSON encoders/decoders
+
+
+encodeUser : GetUserResponse -> Encode.Value
+encodeUser user =
+    Encode.object
+        [ { key = "id", value = Encode.int user.id }
+        , { key = "firstName", value = Encode.string user.firstName }
+        , { key = "lastName", value = Encode.string user.lastName }
+        , { key = "email", value = Encode.string user.email }
+        ]
+
+
+decodeCreateUser : Decode.Decoder CreateUserRequest
+decodeCreateUser =
+    Decode.map3
+        (\firstName lastName email -> { firstName = firstName, lastName = lastName, email = email })
+        (Decode.field "firstName" Decode.string)
+        (Decode.field "lastName" Decode.string)
+        (Decode.field "email" Decode.string)
+
+
+
+-- Routes define the input, output, and handler for any given route. If the types of a route's handler
+-- do not match the types of the decoder/encoder and the route params you will get a compile error.
+
+
+getUserRoute : RouteHandler AppModel Error
+getUserRoute =
+    Grenite.createRoute
+        { method = HttpServer.GET
+        , route =
+            RouteParser.defineRoute
+                "/user/:id"
+                (RouteParser.succeed (\id -> { id = id })
+                    |> RouteParser.required "id" RouteParser.int
+                )
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeUser
+        , handler = getUserHandler
+        }
+
+
+getPostRoute : RouteHandler AppModel Error
+getPostRoute =
+    Grenite.createRoute
+        { method = HttpServer.GET
+        , route =
+            RouteParser.defineRoute "/user/:userId/post/:postId"
+                (RouteParser.succeed (\userId postId -> { userId = userId, postId = postId })
+                    |> RouteParser.required "userId" RouteParser.int
+                    |> RouteParser.required "postId" RouteParser.int
+                )
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.stringResponseBodyEncoder
+        , handler = getPostHandler
+        }
+
+
+createUserRoute : RouteHandler AppModel Error
+createUserRoute =
+    Grenite.createRoute
+        { method = HttpServer.POST
+        , route =
+            RouteParser.defineRoute "/user" RouteParser.noParams
+        , requestDecoder = Helpers.jsonRequestBodyDecoder decodeCreateUser
+        , responseEncoder = Helpers.emptyResponseBodyEncoder
+        , handler = createUserHandler
+        }
+
+
+
+-- Handlers
+
+
+getUserHandler : AppModel -> Request { id : Int } Helpers.EmptyRequestBody -> Task Error (Response GetUserResponse)
+getUserHandler _ request =
+    let
+        userId =
+            request.params.id
+    in
+    if userId <= 0 then
+        Task.fail (ValidationError "User ID must be positive")
+
+    else
+        -- Create tasks to do whatever is needed to fetch a user, (database call, etc.), in this example we just mock a response.
+        Task.succeed
+            { status = 200
+            , body =
+                { id = userId
+                , firstName = "John"
+                , lastName = "Doe"
+                , email = "john.doe@example.com"
+                }
+            , headers = [ Http.ResponseContentType Http.ApplicationJson ]
+            }
+
+
+getPostHandler : AppModel -> Request { userId : Int, postId : Int } Helpers.EmptyRequestBody -> Task Error (Response String)
+getPostHandler _ request =
+    let
+        userId =
+            request.params.userId
+
+        postId =
+            request.params.postId
+    in
+    if userId <= 0 || postId <= 0 then
+        Task.fail (ValidationError "User ID and Post ID must be positive")
+
+    else
+        Task.succeed
+            { status = 200
+            , body = "User " ++ String.fromInt userId ++ " - Post " ++ String.fromInt postId
+            , headers = [ Http.ResponseContentType Http.TextPlain ]
+            }
+
+
+createUserHandler : AppModel -> Request Helpers.NoRouteParams CreateUserRequest -> Task Error (Response Helpers.EmptyResponseBody)
+createUserHandler _ request =
+    let
+        userData =
+            request.body
+    in
+    if String.isEmpty userData.email then
+        Task.fail (ValidationError "Email is required")
+
+    else if String.isEmpty userData.firstName then
+        Task.fail (ValidationError "First name is required")
+
+    else if String.isEmpty userData.lastName then
+        Task.fail (ValidationError "Last name is required")
+
+    else
+        Task.succeed
+            { status = 201
+            , body = {}
+            , headers = []
+            }
+
+
+
+-- Global error handler
+
+
+handleError : Error -> Response String
+handleError error =
+    when error is
+        Http httpError ->
+            Grenite.ErrorHelpers.httpClientErrorToResponse httpError
+
+        ValidationError message ->
+            { status = 422
+            , body = "{\"error\": \"Validation Failed\", \"message\": \"" ++ message ++ "\"}"
+            , headers = []
+            }
+
+
+handleNotFound : HttpServer.Request -> Response String
+handleNotFound _ =
+    { status = 404
+    , body = "{\"error\": \"Not Found\"}"
+    , headers = []
+    }

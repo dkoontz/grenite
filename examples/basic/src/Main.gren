@@ -1,0 +1,9 @@
+module Main exposing (main)
+
+import Grenite
+import RouteExample
+
+
+main : Grenite.Server RouteExample.AppModel RouteExample.Error
+main =
+    Grenite.createServer RouteExample.application

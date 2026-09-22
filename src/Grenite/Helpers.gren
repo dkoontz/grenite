@@ -1,0 +1,42 @@
+module Grenite.Helpers exposing (EmptyRequestBody, EmptyResponseBody, NoRouteParams, emptyRequestBodyDecoder, emptyResponseBodyEncoder, jsonRequestBodyDecoder, jsonResponseBodyEncoder, stringResponseBodyEncoder)
+
+import Json.Decode as Decode
+import Json.Encode as Encode
+
+
+type alias NoRouteParams =
+    {}
+
+
+type alias EmptyRequestBody =
+    {}
+
+
+type alias EmptyResponseBody =
+    {}
+
+
+emptyRequestBodyDecoder : String -> Result String EmptyRequestBody
+emptyRequestBodyDecoder _ =
+    Ok {}
+
+
+emptyResponseBodyEncoder : EmptyResponseBody -> String
+emptyResponseBodyEncoder _ =
+    ""
+
+
+jsonRequestBodyDecoder : Decode.Decoder a -> String -> Result String a
+jsonRequestBodyDecoder decoder body =
+    Decode.decodeString decoder body
+        |> Result.mapError (\err -> "The Request body didn't match what I was expecting. " ++ Decode.errorToString err)
+
+
+jsonResponseBodyEncoder : (a -> Encode.Value) -> a -> String
+jsonResponseBodyEncoder encoder value =
+    Encode.encode 0 (encoder value)
+
+
+stringResponseBodyEncoder : String -> String
+stringResponseBodyEncoder body =
+    body
