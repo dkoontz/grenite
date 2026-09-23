@@ -1,0 +1,521 @@
+module Shared exposing
+    ( AppModel
+    , Error(..)
+    , FieldError
+    , blankErrors
+    , cantBeNull
+    , corsHeaders
+    , encodeMaybe
+    , flatten
+    , fromFieldErrors
+    , handleNotFound
+    , handleError
+    , jsonHeaders
+    , minLengthErrors
+    , optionalField
+    , optionalUser
+    , optionsRoute
+    , queryLimit
+    , queryOffset
+    , queryParams
+    , requireUser
+    , setPatch
+    , supabaseError
+    , tokenFromRequest
+    )
+
+import Array exposing (Array)
+import Dict exposing (Dict)
+import Grenite
+import Grenite.Helpers as Helpers
+import Grenite.Http as Http
+import Grenite.RouteParser as RouteParser
+import Grenite.Types exposing (Request, Response, RouteHandler)
+import HttpClient
+import HttpServer
+import Json.Decode as Decode
+import Json.Encode as Encode
+import Supabase exposing (User)
+import Task exposing (Task)
+import Url
+
+
+{-| The shared server state: everything the handlers need to reach the
+database, resolved once at startup.
+-}
+type alias AppModel =
+    { config : Supabase.Config
+    }
+
+
+{-| One failure entry for a 422 response: a field name and the messages for
+that field, such as `{ field = "username", messages = [ "can't be blank" ] }`.
+-}
+type alias FieldError =
+    { field : String
+    , messages : Array String
+    }
+
+
+{-| Every route fails with this type. `handleError` maps each case onto the
+status code and JSON body the RealWorld API expects.
+-}
+type Error
+    = DbError String
+    | MissingToken
+    | InvalidToken
+    | InvalidCredentials
+    | ValidationFailed (Array FieldError)
+    | AlreadyTaken String
+    | NotFound String
+    | Forbidden String
+
+
+
+-- Headers
+
+
+{-| Headers for every JSON response. The RealWorld spec asks for
+`Content-Type: application/json; charset=utf-8` and for CORS headers, because
+the frontend usually runs on another port.
+-}
+jsonHeaders : Array Http.ResponseHeader
+jsonHeaders =
+    [ Http.ResponseCustomHeader { name = "Content-Type", value = "application/json; charset=utf-8" }
+    , Http.ResponseAccessControlAllowOrigin Http.Wildcard
+    ]
+
+
+{-| Extra headers for CORS preflight responses.
+-}
+corsHeaders : Array Http.ResponseHeader
+corsHeaders =
+    Array.append jsonHeaders
+        [ Http.ResponseAccessControlAllowHeaders [ "Content-Type", "Authorization" ]
+        , Http.ResponseAccessControlAllowMethods
+            [ HttpServer.GET
+            , HttpServer.POST
+            , HttpServer.PUT
+            , HttpServer.DELETE
+            , HttpServer.UNKNOWN "OPTIONS"
+            ]
+        ]
+
+
+
+-- Error responses
+
+
+fieldMessages : String -> Array String -> { key : String, value : Encode.Value }
+fieldMessages field messages =
+    { key = field, value = Encode.array Encode.string messages }
+
+
+errorsBody : Array { key : String, value : Encode.Value } -> String
+errorsBody fields =
+    Encode.encode 0
+        (Encode.object
+            [ { key = "errors", value = Encode.object fields } ]
+        )
+
+
+handleError : Error -> Response String
+handleError error =
+    when error is
+        DbError message ->
+            { status = 500
+            , body = errorsBody [ fieldMessages "server" [ message ] ]
+            , headers = corsHeaders
+            }
+
+        MissingToken ->
+            { status = 401
+            , body = errorsBody [ fieldMessages "token" [ "is missing" ] ]
+            , headers = corsHeaders
+            }
+
+        InvalidToken ->
+            { status = 401
+            , body = errorsBody [ fieldMessages "token" [ "is invalid" ] ]
+            , headers = corsHeaders
+            }
+
+        InvalidCredentials ->
+            { status = 401
+            , body = errorsBody [ fieldMessages "credentials" [ "invalid" ] ]
+            , headers = corsHeaders
+            }
+
+        ValidationFailed fields ->
+            { status = 422
+            , body = errorsBody (Array.map (\field -> fieldMessages field.field field.messages) fields)
+            , headers = corsHeaders
+            }
+
+        AlreadyTaken field ->
+            { status = 409
+            , body = errorsBody [ fieldMessages field [ "has already been taken" ] ]
+            , headers = corsHeaders
+            }
+
+        NotFound field ->
+            { status = 404
+            , body = errorsBody [ fieldMessages field [ "not found" ] ]
+            , headers = corsHeaders
+            }
+
+        Forbidden field ->
+            { status = 403
+            , body = errorsBody [ fieldMessages field [ "forbidden" ] ]
+            , headers = corsHeaders
+            }
+
+
+handleNotFound : HttpServer.Request -> Response String
+handleNotFound _ =
+    { status = 404
+    , body = errorsBody [ fieldMessages "route" [ "not found" ] ]
+    , headers = corsHeaders
+    }
+
+
+{-| A failed Supabase request maps onto the same HTTP responses the task
+port rejections used to produce.
+-}
+supabaseError : Supabase.Error -> Error
+supabaseError error =
+    when error is
+        Supabase.ArticleNotFound ->
+            NotFound "article"
+
+        Supabase.ProfileNotFound ->
+            NotFound "profile"
+
+        Supabase.CommentNotFound ->
+            NotFound "comment"
+
+        Supabase.ArticleForbidden ->
+            Forbidden "article"
+
+        Supabase.CommentForbidden ->
+            Forbidden "comment"
+
+        Supabase.UsernameTaken ->
+            AlreadyTaken "username"
+
+        Supabase.EmailTaken ->
+            AlreadyTaken "email"
+
+        Supabase.NetworkError httpError ->
+            DbError (HttpClient.errorToString httpError)
+
+        Supabase.BadResponse message ->
+            DbError message
+
+        Supabase.UnexpectedBody message ->
+            DbError message
+
+
+
+-- Validation
+
+
+{-| Errors for a field that must be present and non-blank. `Nothing` covers
+both an absent field and an explicit `null`.
+-}
+blankErrors : String -> Maybe String -> Array FieldError
+blankErrors field maybeValue =
+    let
+        blank =
+            when maybeValue is
+                Nothing ->
+                    True
+
+                Just value ->
+                    String.isEmpty (String.trim value)
+    in
+    if blank then
+        [ { field = field, messages = [ "can't be blank" ] } ]
+
+    else
+        []
+
+
+{-| Errors for a field that must be at least `minimum` characters. A blank
+value produces no error here, so pair this with `blankErrors` and a blank
+field reports only "can't be blank".
+-}
+minLengthErrors : Int -> String -> Maybe String -> Array FieldError
+minLengthErrors minimum field maybeValue =
+    when maybeValue is
+        Just value ->
+            if String.isEmpty (String.trim value) then
+                []
+
+            else if String.unitLength value < minimum then
+                [ { field = field
+                  , messages = [ "is too short (minimum is " ++ String.fromInt minimum ++ " characters)" ]
+                  }
+                ]
+
+            else
+                []
+
+        Nothing ->
+            []
+
+
+{-| Errors for a field that was sent as explicit `null` but must not be.
+The argument distinguishes three states: `Nothing` means the field was absent
+from the JSON, `Just Nothing` means it was `null`.
+-}
+cantBeNull : String -> Maybe (Maybe a) -> Array FieldError
+cantBeNull field maybeValue =
+    when maybeValue is
+        Just Nothing ->
+            [ { field = field, messages = [ "can't be null" ] } ]
+
+        _ ->
+            []
+
+
+fromFieldErrors : Array FieldError -> Task Error {}
+fromFieldErrors errors =
+    if Array.isEmpty errors then
+        Task.succeed {}
+
+    else
+        Task.fail (ValidationFailed errors)
+
+
+{-| Build patch entries for fields that only ever hold strings: absent or
+`null` means "leave unchanged", a value means "set it". The database applies
+these keys through the `update_user` and `update_article` functions.
+-}
+setPatch : String -> Maybe (Maybe String) -> Array Supabase.Patch
+setPatch field maybeValue =
+    when maybeValue is
+        Just (Just value) ->
+            [ { key = field, value = Encode.string value } ]
+
+        _ ->
+            []
+
+
+
+-- JSON decode helpers
+
+
+{-| Decode a field that may be absent or null. `Nothing` means the field was
+absent, `Just Nothing` means it was `null`, and `Just (Just v)` means it held
+a value.
+-}
+optionalField : String -> Decode.Decoder a -> Decode.Decoder (Maybe (Maybe a))
+optionalField name decoder =
+    Decode.maybe (Decode.field name (Decode.nullable decoder))
+
+
+flatten : Maybe (Maybe a) -> Maybe a
+flatten nested =
+    when nested is
+        Nothing ->
+            Nothing
+
+        Just inner ->
+            inner
+
+
+encodeMaybe : (a -> Encode.Value) -> Maybe a -> Encode.Value
+encodeMaybe encode maybe =
+    when maybe is
+        Nothing ->
+            Encode.null
+
+        Just value ->
+            encode value
+
+
+
+-- Authentication
+
+
+{-| Read the RealWorld token from `Authorization: Token jwt.token.here`.
+A `Bearer` token also works.
+-}
+tokenFromRequest : Request routeParams requestBody -> Maybe String
+tokenFromRequest request =
+    request.headers
+        |> Array.findFirst isAuthorization
+        |> Maybe.map .value
+        |> Maybe.andThen credentialsFromAuth
+
+
+isAuthorization : Http.RequestHeader -> Bool
+isAuthorization header =
+    when header is
+        Http.RequestAuthorization _ ->
+            True
+
+        _ ->
+            False
+
+
+credentialsFromAuth : Http.RequestHeader -> Maybe String
+credentialsFromAuth header =
+    when header is
+        Http.RequestAuthorization auth ->
+            when auth is
+                Http.Bearer token ->
+                    Just token
+
+                Http.CustomAuth { scheme, credentials } ->
+                    if scheme == "Token" then
+                        Just credentials
+
+                    else
+                        Nothing
+
+                Http.Basic _ ->
+                    Nothing
+
+        _ ->
+            Nothing
+
+
+{-| Verify the token and load the user it names. Fails with `MissingToken`,
+`InvalidToken`, or a database error.
+-}
+requireUser : Supabase.Config -> Maybe String -> Task Error User
+requireUser config maybeToken =
+    when maybeToken is
+        Nothing ->
+            Task.fail MissingToken
+
+        Just token ->
+            Supabase.verifyToken config token
+                |> Task.mapError supabaseError
+                |> Task.andThen
+                    (\maybeUser ->
+                        when maybeUser is
+                            Just user ->
+                                Task.succeed user
+
+                            Nothing ->
+                                Task.fail InvalidToken
+                    )
+
+
+{-| Like `requireUser`, but a request without a token succeeds as `Nothing`.
+A request with an invalid token still fails.
+-}
+optionalUser : Supabase.Config -> Maybe String -> Task Error (Maybe User)
+optionalUser config maybeToken =
+    when maybeToken is
+        Nothing ->
+            Task.succeed Nothing
+
+        Just _ ->
+            Task.map Just (requireUser config maybeToken)
+
+
+
+-- Query parameters
+
+
+{-| Parse a raw query string such as `tag=dragons&limit=10` into a dict.
+The first occurrence of a key wins. Keys and values are percent-decoded.
+-}
+queryParams : Maybe String -> Dict String String
+queryParams maybeQuery =
+    when maybeQuery is
+        Nothing ->
+            Dict.empty
+
+        Just query ->
+            query
+                |> String.split "&"
+                |> Array.keepIf (\pair -> not (String.isEmpty pair))
+                |> Array.foldl
+                    (\pair dict ->
+                        when parsePair pair is
+                            Just { key, value } ->
+                                if Dict.member key dict then
+                                    dict
+
+                                else
+                                    Dict.set key value dict
+
+                            Nothing ->
+                                dict
+                    )
+                    Dict.empty
+
+
+parsePair : String -> Maybe { key : String, value : String }
+parsePair pair =
+    let
+        parts =
+            String.split "=" pair
+
+        decoded raw =
+            Maybe.withDefault raw (Url.percentDecode raw)
+    in
+    when Array.first parts is
+        Nothing ->
+            Nothing
+
+        Just rawKey ->
+            Just
+                { key = decoded rawKey
+                , value =
+                    parts
+                        |> Array.dropFirst 1
+                        |> String.join "="
+                        |> decoded
+                }
+
+
+{-| The `limit` query parameter. Defaults to 20. A value below 1 is ignored.
+-}
+queryLimit : Dict String String -> Int
+queryLimit params =
+    when Maybe.andThen String.toInt (Dict.get "limit" params) is
+        Just n ->
+            if n > 0 then
+                n
+
+            else
+                20
+
+        Nothing ->
+            20
+
+
+{-| The `offset` query parameter. Defaults to 0. Negative values become 0.
+-}
+queryOffset : Dict String String -> Int
+queryOffset params =
+    when Maybe.andThen String.toInt (Dict.get "offset" params) is
+        Just n ->
+            max 0 n
+
+        Nothing ->
+            0
+
+
+
+-- CORS preflight
+
+
+{-| A route that answers `OPTIONS <pattern>` with 204 and the CORS headers,
+so browser frontends can preflight any API path.
+-}
+optionsRoute : String -> RouteHandler AppModel Error
+optionsRoute pattern =
+    Grenite.createRoute
+        { method = HttpServer.UNKNOWN "OPTIONS"
+        , route = RouteParser.defineRoute pattern RouteParser.noParams
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.emptyResponseBodyEncoder
+        , handler = \_ _ -> Task.succeed { status = 204, body = {}, headers = corsHeaders }
+        }

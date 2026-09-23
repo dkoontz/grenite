@@ -12,6 +12,10 @@ Requirements: Gren 0.6.5 and Node.js (current LTS).
 
 See `examples/basic` for a complete server.
 See `examples/sqlite` for a server that stores data in SQLite through task ports.
+See `examples/realworld` for a backend that implements the RealWorld API spec
+against Supabase Postgres and passes the official Hurl suite.
+See `examples/realworld-supabase` for the same backend rebuilt on the
+Supabase HTTP API, with no task ports.
 
 ## Define routes
 
@@ -73,6 +77,11 @@ main =
     Grenite.createServer application
 ```
 
+`init` receives a `Grenite.Types.InitContext` record: the Node environment,
+an `HttpClient.Permission` for outbound requests, and the process
+environment variables. See `examples/realworld-supabase` for a server that
+uses all three.
+
 ## Modules
 
 | Module                 | Purpose                                                             |
@@ -125,3 +134,37 @@ The file `main.js` imports that build, opens a SQLite database, and registers
 one task port handler per port. The server listens on `0.0.0.0:3000`.
 
 See `examples/sqlite/README.md` for the endpoint list.
+
+### realworld
+
+```bash
+cd examples/realworld
+npm install
+npm run db:up
+npm run build
+npm start
+```
+
+A full RealWorld backend backed by Supabase Postgres via Docker Compose.
+The server listens on `0.0.0.0:3000`. `npm test` runs the official Hurl
+contract suite, which requires `brew install hurl`.
+
+See `examples/realworld/README.md` for the endpoint list.
+
+### realworld-supabase
+
+```bash
+cd examples/realworld-supabase
+npm install
+npm run db:up
+npm run db:prepare
+npm run build
+npm start
+```
+
+The same RealWorld backend, rebuilt on the Supabase HTTP API: PostgREST
+runs next to Postgres in Docker Compose, the Gren app makes every database
+call over HTTP, and no task ports remain. `npm test` runs the same Hurl
+suite.
+
+See `examples/realworld-supabase/README.md` for how the pieces connect.

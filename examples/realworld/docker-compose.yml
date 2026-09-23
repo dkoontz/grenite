@@ -1,0 +1,16 @@
+services:
+  db:
+    # Supabase's Postgres distribution: unmodified PostgreSQL with Supabase's
+    # curated extensions. The app connects as the image's default user
+    # "supabase_admin" with password "postgres".
+    image: supabase/postgres:15.8.1.135
+    container_name: grenite-realworld-db
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "127.0.0.1:54322:5432"
+    volumes:
+      - realworld-db:/var/lib/postgresql/data
+
+volumes:
+  realworld-db:

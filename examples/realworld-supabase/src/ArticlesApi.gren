@@ -1,0 +1,535 @@
+module ArticlesApi exposing (routes)
+
+import Array exposing (Array)
+import Dict exposing (Dict)
+import Grenite
+import Grenite.Helpers as Helpers
+import Grenite.Http as Http
+import Grenite.RouteParser as RouteParser
+import Grenite.Types exposing (Request, Response, RouteHandler)
+import HttpServer
+import Json.Decode as Decode
+import Json.Encode as Encode
+import Shared exposing (AppModel, Error, FieldError)
+import Supabase exposing
+    ( Article
+    , ArticlePage
+    , ArticleSummary
+    , ListArticlesQuery
+    , Profile
+    )
+import Task exposing (Task)
+
+
+routes : Array (RouteHandler AppModel Error)
+routes =
+    Array.append
+        [ listArticlesRoute
+        , feedRoute
+        , getArticleRoute
+        , createArticleRoute
+        , updateArticleRoute
+        , deleteArticleRoute
+        , favoriteRoute
+        , unfavoriteRoute
+        , tagsRoute
+        ]
+        (Array.map
+            Shared.optionsRoute
+            [ "/api/articles"
+            , "/api/articles/feed"
+            , "/api/articles/:slug"
+            , "/api/articles/:slug/favorite"
+            , "/api/articles/:slug/comments"
+            , "/api/articles/:slug/comments/:id"
+            , "/api/tags"
+            ]
+        )
+
+
+
+-- Request and response shapes
+
+
+type alias SlugParams =
+    { slug : String
+    }
+
+
+type alias CreateArticleBody =
+    { title : Maybe String
+    , description : Maybe String
+    , body : Maybe String
+    , tagList : Maybe (Array String)
+    }
+
+
+{-| Fields accepted by `PUT /api/articles/:slug`. Absent means "leave
+unchanged". An explicit `null` for the text fields also means "leave
+unchanged"; a blank string is rejected. For `tagList`, absent means "keep the
+existing tags", an explicit `null` is rejected, and an array replaces the
+tags.
+-}
+type alias UpdateArticleBody =
+    { title : Maybe (Maybe String)
+    , description : Maybe (Maybe String)
+    , body : Maybe (Maybe String)
+    , tagList : Maybe (Maybe (Array String))
+    }
+
+
+type alias ArticleResponse =
+    { article : Article
+    }
+
+
+type alias ArticlesResponse =
+    { articles : Array ArticleSummary
+    , articlesCount : Int
+    }
+
+
+type alias TagsResponse =
+    { tags : Array String
+    }
+
+
+
+-- Routes
+
+
+listArticlesRoute : RouteHandler AppModel Error
+listArticlesRoute =
+    Grenite.createRoute
+        { method = HttpServer.GET
+        , route = RouteParser.defineRoute "/api/articles" RouteParser.noParams
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeArticlesResponse
+        , handler = listArticlesHandler
+        }
+
+
+{-| The feed route must be declared before the `:slug` route. Both match
+`GET /api/articles/<something>`, and routes are tried in order.
+-}
+feedRoute : RouteHandler AppModel Error
+feedRoute =
+    Grenite.createRoute
+        { method = HttpServer.GET
+        , route = RouteParser.defineRoute "/api/articles/feed" RouteParser.noParams
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeArticlesResponse
+        , handler = feedHandler
+        }
+
+
+getArticleRoute : RouteHandler AppModel Error
+getArticleRoute =
+    Grenite.createRoute
+        { method = HttpServer.GET
+        , route =
+            RouteParser.defineRoute
+                "/api/articles/:slug"
+                (RouteParser.succeed (\slug -> { slug = slug })
+                    |> RouteParser.required "slug" RouteParser.string
+                )
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeArticleResponse
+        , handler = getArticleHandler
+        }
+
+
+createArticleRoute : RouteHandler AppModel Error
+createArticleRoute =
+    Grenite.createRoute
+        { method = HttpServer.POST
+        , route = RouteParser.defineRoute "/api/articles" RouteParser.noParams
+        , requestDecoder = Helpers.jsonRequestBodyDecoder decodeCreateArticleBody
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeArticleResponse
+        , handler = createArticleHandler
+        }
+
+
+updateArticleRoute : RouteHandler AppModel Error
+updateArticleRoute =
+    Grenite.createRoute
+        { method = HttpServer.PUT
+        , route =
+            RouteParser.defineRoute
+                "/api/articles/:slug"
+                (RouteParser.succeed (\slug -> { slug = slug })
+                    |> RouteParser.required "slug" RouteParser.string
+                )
+        , requestDecoder = Helpers.jsonRequestBodyDecoder decodeUpdateArticleBody
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeArticleResponse
+        , handler = updateArticleHandler
+        }
+
+
+deleteArticleRoute : RouteHandler AppModel Error
+deleteArticleRoute =
+    Grenite.createRoute
+        { method = HttpServer.DELETE
+        , route =
+            RouteParser.defineRoute
+                "/api/articles/:slug"
+                (RouteParser.succeed (\slug -> { slug = slug })
+                    |> RouteParser.required "slug" RouteParser.string
+                )
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.emptyResponseBodyEncoder
+        , handler = deleteArticleHandler
+        }
+
+
+favoriteRoute : RouteHandler AppModel Error
+favoriteRoute =
+    Grenite.createRoute
+        { method = HttpServer.POST
+        , route =
+            RouteParser.defineRoute
+                "/api/articles/:slug/favorite"
+                (RouteParser.succeed (\slug -> { slug = slug })
+                    |> RouteParser.required "slug" RouteParser.string
+                )
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeArticleResponse
+        , handler = favoriteHandler
+        }
+
+
+unfavoriteRoute : RouteHandler AppModel Error
+unfavoriteRoute =
+    Grenite.createRoute
+        { method = HttpServer.DELETE
+        , route =
+            RouteParser.defineRoute
+                "/api/articles/:slug/favorite"
+                (RouteParser.succeed (\slug -> { slug = slug })
+                    |> RouteParser.required "slug" RouteParser.string
+                )
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeArticleResponse
+        , handler = unfavoriteHandler
+        }
+
+
+tagsRoute : RouteHandler AppModel Error
+tagsRoute =
+    Grenite.createRoute
+        { method = HttpServer.GET
+        , route = RouteParser.defineRoute "/api/tags" RouteParser.noParams
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeTagsResponse
+        , handler = tagsHandler
+        }
+
+
+
+-- Handlers
+
+
+listArticlesHandler : AppModel -> Request Helpers.NoRouteParams Helpers.EmptyRequestBody -> Task Error (Response ArticlesResponse)
+listArticlesHandler model request =
+    let
+        params =
+            Shared.queryParams request.url.query
+
+        query =
+            { tag = Dict.get "tag" params
+            , author = Dict.get "author" params
+            , favorited = Dict.get "favorited" params
+            , viewerId = Nothing
+            , limit = Shared.queryLimit params
+            , offset = Shared.queryOffset params
+            }
+    in
+    Shared.optionalUser model.config (Shared.tokenFromRequest request)
+        |> Task.andThen
+            (\maybeViewer ->
+                Supabase.listArticles model.config { query | viewerId = Maybe.map .id maybeViewer }
+                    |> Task.mapError Shared.supabaseError
+            )
+        |> Task.map (okPage 200)
+
+
+feedHandler : AppModel -> Request Helpers.NoRouteParams Helpers.EmptyRequestBody -> Task Error (Response ArticlesResponse)
+feedHandler model request =
+    let
+        params =
+            Shared.queryParams request.url.query
+    in
+    Shared.requireUser model.config (Shared.tokenFromRequest request)
+        |> Task.andThen
+            (\viewer ->
+                Supabase.listFeed model.config
+                    { viewerId = viewer.id
+                    , limit = Shared.queryLimit params
+                    , offset = Shared.queryOffset params
+                    }
+                    |> Task.mapError Shared.supabaseError
+            )
+        |> Task.map (okPage 200)
+
+
+okPage : Int -> ArticlePage -> Response ArticlesResponse
+okPage status page =
+    { status = status
+    , body = { articles = page.articles, articlesCount = page.count }
+    , headers = Shared.jsonHeaders
+    }
+
+
+getArticleHandler : AppModel -> Request SlugParams Helpers.EmptyRequestBody -> Task Error (Response ArticleResponse)
+getArticleHandler model request =
+    Shared.optionalUser model.config (Shared.tokenFromRequest request)
+        |> Task.andThen
+            (\maybeViewer ->
+                Supabase.getArticle model.config
+                    { slug = request.params.slug
+                    , viewerId = Maybe.map .id maybeViewer
+                    }
+                    |> Task.mapError Shared.supabaseError
+            )
+        |> Task.andThen
+            (\maybeArticle ->
+                when maybeArticle is
+                    Just article ->
+                        Task.succeed { status = 200, body = { article = article }, headers = Shared.jsonHeaders }
+
+                    Nothing ->
+                        Task.fail (Shared.NotFound "article")
+            )
+
+
+createArticleHandler : AppModel -> Request Helpers.NoRouteParams CreateArticleBody -> Task Error (Response ArticleResponse)
+createArticleHandler model request =
+    Shared.requireUser model.config (Shared.tokenFromRequest request)
+        |> Task.andThen (\author -> createArticle model.config author.id request.body)
+        |> Task.map (\article -> { status = 201, body = { article = article }, headers = Shared.jsonHeaders })
+
+
+createArticle : Supabase.Config -> Int -> CreateArticleBody -> Task Error Article
+createArticle config authorId body =
+    Shared.fromFieldErrors
+        (Array.foldl Array.append
+            []
+            [ Shared.blankErrors "title" body.title
+            , Shared.blankErrors "description" body.description
+            , Shared.blankErrors "body" body.body
+            ]
+        )
+        |> Task.andThen
+            (\_ ->
+                Supabase.createArticle config
+                    { authorId = authorId
+                    , title = Maybe.withDefault "" body.title
+                    , description = Maybe.withDefault "" body.description
+                    , body = Maybe.withDefault "" body.body
+                    , tagList = Maybe.withDefault [] body.tagList
+                    }
+                    |> Task.mapError Shared.supabaseError
+            )
+
+
+updateArticleHandler : AppModel -> Request SlugParams UpdateArticleBody -> Task Error (Response ArticleResponse)
+updateArticleHandler model request =
+    Shared.requireUser model.config (Shared.tokenFromRequest request)
+        |> Task.andThen (\user -> updateArticle model.config user.id request.params.slug request.body)
+        |> Task.map (\article -> { status = 200, body = { article = article }, headers = Shared.jsonHeaders })
+
+
+updateArticle : Supabase.Config -> Int -> String -> UpdateArticleBody -> Task Error Article
+updateArticle config requesterId slug body =
+    Shared.fromFieldErrors (updateArticleChecks body)
+        |> Task.andThen
+            (\_ ->
+                Supabase.updateArticle config
+                    { slug = slug
+                    , requesterId = requesterId
+                    , patch =
+                        Array.foldl Array.append
+                            []
+                            [ Shared.setPatch "title" body.title
+                            , Shared.setPatch "description" body.description
+                            , Shared.setPatch "body" body.body
+                            ]
+                    , tagList = Shared.flatten body.tagList
+                    }
+                    |> Task.mapError Shared.supabaseError
+            )
+
+
+updateArticleChecks : UpdateArticleBody -> Array FieldError
+updateArticleChecks body =
+    Array.foldl Array.append
+        []
+        [ requiredText "title" body.title
+        , requiredText "description" body.description
+        , requiredText "body" body.body
+        , Shared.cantBeNull "tagList" body.tagList
+        ]
+
+
+{-| Errors for a text field that is fine to omit, but must not be blank when
+present.
+-}
+requiredText : String -> Maybe (Maybe String) -> Array FieldError
+requiredText field maybeValue =
+    when maybeValue is
+        Just (Just value) ->
+            Shared.blankErrors field (Just value)
+
+        _ ->
+            []
+
+
+deleteArticleHandler : AppModel -> Request SlugParams Helpers.EmptyRequestBody -> Task Error (Response Helpers.EmptyResponseBody)
+deleteArticleHandler model request =
+    Shared.requireUser model.config (Shared.tokenFromRequest request)
+        |> Task.andThen
+            (\user ->
+                Supabase.deleteArticle model.config
+                    { slug = request.params.slug
+                    , requesterId = user.id
+                    }
+                    |> Task.mapError Shared.supabaseError
+            )
+        |> Task.map (\_ -> { status = 204, body = {}, headers = Shared.corsHeaders })
+
+
+favoriteHandler : AppModel -> Request SlugParams Helpers.EmptyRequestBody -> Task Error (Response ArticleResponse)
+favoriteHandler model request =
+    Shared.requireUser model.config (Shared.tokenFromRequest request)
+        |> Task.andThen
+            (\user ->
+                Supabase.favoriteArticle model.config
+                    { slug = request.params.slug
+                    , viewerId = user.id
+                    }
+                    |> Task.mapError Shared.supabaseError
+            )
+        |> Task.map (\article -> { status = 200, body = { article = article }, headers = Shared.jsonHeaders })
+
+
+unfavoriteHandler : AppModel -> Request SlugParams Helpers.EmptyRequestBody -> Task Error (Response ArticleResponse)
+unfavoriteHandler model request =
+    Shared.requireUser model.config (Shared.tokenFromRequest request)
+        |> Task.andThen
+            (\user ->
+                Supabase.unfavoriteArticle model.config
+                    { slug = request.params.slug
+                    , viewerId = user.id
+                    }
+                    |> Task.mapError Shared.supabaseError
+            )
+        |> Task.map (\article -> { status = 200, body = { article = article }, headers = Shared.jsonHeaders })
+
+
+tagsHandler : AppModel -> Request Helpers.NoRouteParams Helpers.EmptyRequestBody -> Task Error (Response TagsResponse)
+tagsHandler model _ =
+    Supabase.listTags model.config
+        |> Task.mapError Shared.supabaseError
+        |> Task.map (\tags -> { status = 200, body = { tags = tags }, headers = Shared.jsonHeaders })
+
+
+
+-- Encoders
+
+
+decodeCreateArticleBody : Decode.Decoder CreateArticleBody
+decodeCreateArticleBody =
+    Decode.map
+        (\title description body tagList ->
+            { title = title
+            , description = description
+            , body = body
+            , tagList = tagList
+            }
+        )
+        (Decode.field "article" (Decode.map Shared.flatten (Shared.optionalField "title" Decode.string)))
+        |> Decode.andMap (Decode.field "article" (Decode.map Shared.flatten (Shared.optionalField "description" Decode.string)))
+        |> Decode.andMap (Decode.field "article" (Decode.map Shared.flatten (Shared.optionalField "body" Decode.string)))
+        |> Decode.andMap (Decode.field "article" (Decode.map Shared.flatten (Shared.optionalField "tagList" (Decode.array Decode.string))))
+
+
+decodeUpdateArticleBody : Decode.Decoder UpdateArticleBody
+decodeUpdateArticleBody =
+    Decode.map
+        (\title description body tagList ->
+            { title = title
+            , description = description
+            , body = body
+            , tagList = tagList
+            }
+        )
+        (Decode.field "article" (Shared.optionalField "title" Decode.string))
+        |> Decode.andMap (Decode.field "article" (Shared.optionalField "description" Decode.string))
+        |> Decode.andMap (Decode.field "article" (Shared.optionalField "body" Decode.string))
+        |> Decode.andMap (Decode.field "article" (Shared.optionalField "tagList" (Decode.array Decode.string)))
+
+
+encodeProfile : Profile -> Encode.Value
+encodeProfile profile =
+    Encode.object
+        [ { key = "username", value = Encode.string profile.username }
+        , { key = "bio", value = Shared.encodeMaybe Encode.string profile.bio }
+        , { key = "image", value = Shared.encodeMaybe Encode.string profile.image }
+        , { key = "following", value = Encode.bool profile.following }
+        ]
+
+
+{-| Encode an article with its body, for the single-article endpoints.
+-}
+encodeArticle : Article -> Encode.Value
+encodeArticle article =
+    Encode.object
+        [ { key = "slug", value = Encode.string article.slug }
+        , { key = "title", value = Encode.string article.title }
+        , { key = "description", value = Encode.string article.description }
+        , { key = "body", value = Encode.string article.body }
+        , { key = "tagList", value = Encode.array Encode.string article.tagList }
+        , { key = "createdAt", value = Encode.string article.createdAt }
+        , { key = "updatedAt", value = Encode.string article.updatedAt }
+        , { key = "favorited", value = Encode.bool article.favorited }
+        , { key = "favoritesCount", value = Encode.int article.favoritesCount }
+        , { key = "author", value = encodeProfile article.author }
+        ]
+
+
+{-| Encode an article without its body. The list and feed endpoints omit the
+body on purpose.
+-}
+encodeArticleSummary : ArticleSummary -> Encode.Value
+encodeArticleSummary article =
+    Encode.object
+        [ { key = "slug", value = Encode.string article.slug }
+        , { key = "title", value = Encode.string article.title }
+        , { key = "description", value = Encode.string article.description }
+        , { key = "tagList", value = Encode.array Encode.string article.tagList }
+        , { key = "createdAt", value = Encode.string article.createdAt }
+        , { key = "updatedAt", value = Encode.string article.updatedAt }
+        , { key = "favorited", value = Encode.bool article.favorited }
+        , { key = "favoritesCount", value = Encode.int article.favoritesCount }
+        , { key = "author", value = encodeProfile article.author }
+        ]
+
+
+encodeArticleResponse : ArticleResponse -> Encode.Value
+encodeArticleResponse response =
+    Encode.object
+        [ { key = "article", value = encodeArticle response.article } ]
+
+
+encodeArticlesResponse : ArticlesResponse -> Encode.Value
+encodeArticlesResponse response =
+    Encode.object
+        [ { key = "articles", value = Encode.array encodeArticleSummary response.articles }
+        , { key = "articlesCount", value = Encode.int response.articlesCount }
+        ]
+
+
+encodeTagsResponse : TagsResponse -> Encode.Value
+encodeTagsResponse response =
+    Encode.object
+        [ { key = "tags", value = Encode.array Encode.string response.tags } ]

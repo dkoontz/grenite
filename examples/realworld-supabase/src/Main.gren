@@ -1,0 +1,36 @@
+module Main exposing (main)
+
+import Array exposing (Array)
+import ArticlesApi
+import CommentsApi
+import Grenite
+import Grenite.Types exposing (RouteHandler)
+import ProfilesApi
+import Shared
+import Supabase
+import UsersApi
+
+
+main : Grenite.Server Shared.AppModel Shared.Error
+main =
+    Grenite.createServer
+        { host = "0.0.0.0"
+        , port_ = 3000
+        , routes = routes
+        , notFoundHandler = Shared.handleNotFound
+        , errorHandler = Shared.handleError
+        , init =
+            \context ->
+                { config = Supabase.config context.httpPermission context.variables
+                }
+        }
+
+
+routes : Array (RouteHandler Shared.AppModel Shared.Error)
+routes =
+    Array.foldl Array.append []
+        [ UsersApi.routes
+        , ProfilesApi.routes
+        , ArticlesApi.routes
+        , CommentsApi.routes
+        ]

@@ -1,0 +1,8 @@
+build/
+data/
+node_modules/
+gren_packages/
+.gren/
+
+# The root .gitignore ignores *.js. This file is source, so re-include it.
+!main.js

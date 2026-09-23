@@ -1,0 +1,1117 @@
+module Supabase exposing
+    ( Config
+    , Error(..)
+    , Patch
+    , User
+    , Profile
+    , Article
+    , ArticleSummary
+    , ArticlePage
+    , Comment
+    , ListArticlesQuery
+    , config
+    , registerUser
+    , authenticate
+    , verifyToken
+    , createToken
+    , updateUser
+    , getProfile
+    , setFollowing
+    , getArticle
+    , listArticles
+    , listFeed
+    , createArticle
+    , updateArticle
+    , deleteArticle
+    , favoriteArticle
+    , unfavoriteArticle
+    , addComment
+    , listComments
+    , deleteComment
+    , listTags
+    )
+
+{-| The Supabase data layer.
+
+Every database interaction goes through the Supabase HTTP API (PostgREST):
+
+  - Plain reads use table routes with `select` embeddings. The flags that
+    depend on the viewer (`following`, `favorited`) come from embedding the
+    `follows` and `favorites` rows filtered to the viewer.
+  - Writes that need logic run inside SQL functions under `/rpc`:
+    registration and login (password hashing), tokens (signing and
+    verification), user and article updates (patches and unique slugs),
+    following, and the article totals.
+  - Simple writes post straight to table routes.
+
+A request fails with `ArticleNotFound` and friends when the database reports
+one of the custom `RW*` error codes, or when a lookup comes back empty. The
+route modules turn those into RealWorld HTTP responses through
+`Shared.supabaseError`.
+
+-}
+
+import Array exposing (Array)
+import Bytes
+import Dict exposing (Dict)
+import HttpServer
+import HttpClient
+import Json.Decode as Decode
+import Json.Encode as Encode
+import Task exposing (Task)
+import Url
+
+
+
+-- Errors
+
+
+{-| One failed database operation. The specific cases line up with the
+rejections the task ports used to produce, so `Shared.supabaseError` can map
+them onto the same HTTP responses.
+-}
+type Error
+    = NetworkError HttpClient.Error
+    | BadResponse String
+    | ArticleNotFound
+    | ProfileNotFound
+    | CommentNotFound
+    | ArticleForbidden
+    | CommentForbidden
+    | EmailTaken
+    | UsernameTaken
+    | UnexpectedBody String
+
+
+{-| The JSON body PostgREST sends when the database raises an error:
+`{"code":"23505","message":"...","details":"..."}`.
+-}
+type alias PgFailure =
+    { code : String
+    , message : String
+    , details : Maybe String
+    }
+
+
+fromPgFailure : PgFailure -> Error
+fromPgFailure failure =
+    let
+        haystack =
+            failure.message ++ " " ++ Maybe.withDefault "" failure.details
+    in
+    if failure.code == "23505" then
+        if String.contains "users_email_key" haystack then
+            EmailTaken
+
+        else if String.contains "users_username_key" haystack then
+            UsernameTaken
+
+        else
+            BadResponse haystack
+
+    else if failure.code == "RW404" then
+        if String.contains "profile" failure.message then
+            ProfileNotFound
+
+        else if String.contains "comment" failure.message then
+            CommentNotFound
+
+        else
+            ArticleNotFound
+
+    else if failure.code == "RW403" then
+        if String.contains "comment" failure.message then
+            CommentForbidden
+
+        else
+            ArticleForbidden
+
+    else
+        BadResponse (failure.code ++ ": " ++ failure.message)
+
+
+decodePgFailure : Decode.Decoder PgFailure
+decodePgFailure =
+    Decode.map
+        (\code message details -> { code = code, message = message, details = details })
+        (Decode.field "code" Decode.string)
+        |> Decode.andMap (Decode.field "message" Decode.string)
+        |> Decode.andMap (Decode.maybe (Decode.field "details" Decode.string))
+
+
+mapHttpError : HttpClient.Error -> Error
+mapHttpError httpError =
+    when httpError is
+        HttpClient.BadStatus response ->
+            when Bytes.toString response.data is
+                Just text ->
+                    when Decode.decodeString decodePgFailure text is
+                        Ok failure ->
+                            fromPgFailure failure
+
+                        Err _ ->
+                            BadResponse text
+
+                Nothing ->
+                    BadResponse "the database returned an unreadable error body"
+
+        _ ->
+            NetworkError httpError
+
+
+
+-- Configuration
+
+
+{-| Where to reach PostgREST and how to authenticate. For a hosted Supabase
+project, set `SUPABASE_URL` to `https://<ref>.supabase.co/rest/v1` and pass
+the service role key as both the API key and the bearer token.
+-}
+type alias Config =
+    { http : HttpClient.Permission
+    , url : String
+    , apiKey : String
+    , authorization : Maybe String
+    }
+
+
+config : HttpClient.Permission -> Dict String String -> Config
+config httpPermission variables =
+    { http = httpPermission
+    , url = Maybe.withDefault "http://127.0.0.1:3100" (Dict.get "SUPABASE_URL" variables)
+    , apiKey = Maybe.withDefault "local-dev-key" (Dict.get "SUPABASE_API_KEY" variables)
+    , authorization = Dict.get "SUPABASE_SERVICE_TOKEN" variables
+    }
+
+
+
+-- Types
+
+
+type alias User =
+    { id : Int
+    , email : String
+    , username : String
+    , bio : Maybe String
+    , image : Maybe String
+    }
+
+
+type alias Profile =
+    { username : String
+    , bio : Maybe String
+    , image : Maybe String
+    , following : Bool
+    }
+
+
+{-| An article with its body, as returned by the single-article endpoints.
+-}
+type alias Article =
+    { slug : String
+    , title : String
+    , description : String
+    , body : String
+    , tagList : Array String
+    , createdAt : String
+    , updatedAt : String
+    , favorited : Bool
+    , favoritesCount : Int
+    , author : Profile
+    }
+
+
+{-| An article without its body, as returned by the list and feed endpoints.
+-}
+type alias ArticleSummary =
+    { slug : String
+    , title : String
+    , description : String
+    , tagList : Array String
+    , createdAt : String
+    , updatedAt : String
+    , favorited : Bool
+    , favoritesCount : Int
+    , author : Profile
+    }
+
+
+type alias ArticlePage =
+    { articles : Array ArticleSummary
+    , count : Int
+    }
+
+
+type alias Comment =
+    { id : Int
+    , createdAt : String
+    , updatedAt : String
+    , body : String
+    , author : Profile
+    }
+
+
+type alias ListArticlesQuery =
+    { tag : Maybe String
+    , author : Maybe String
+    , favorited : Maybe String
+    , viewerId : Maybe Int
+    , limit : Int
+    , offset : Int
+    }
+
+
+type alias Patch =
+    { key : String
+    , value : Encode.Value }
+
+
+
+-- HTTP plumbing
+
+
+{-| One query parameter. The value holds the PostgREST filter grammar, and
+is percent-encoded when the URL is built.
+-}
+type alias Param =
+    { key : String
+    , value : String
+    }
+
+
+param : String -> String -> Param
+param key value =
+    { key = key, value = value }
+
+
+eq : String -> String -> Param
+eq column value =
+    param column ("eq." ++ value)
+
+
+buildUrl : Config -> String -> Array Param -> String
+buildUrl cfg path params =
+    if Array.isEmpty params then
+        cfg.url ++ path
+
+    else
+        cfg.url
+            ++ path
+            ++ "?"
+            ++ String.join "&"
+                (Array.map
+                    (\entry -> entry.key ++ "=" ++ Url.percentEncode entry.value)
+                    params
+                )
+
+
+withApiKeys : Config -> HttpClient.RequestConfiguration a -> HttpClient.RequestConfiguration a
+withApiKeys cfg request =
+    let
+        withAuthorization =
+            when cfg.authorization is
+                Just token ->
+                    HttpClient.withHeader "Authorization" ("Bearer " ++ token) request
+
+                Nothing ->
+                    request
+    in
+    HttpClient.withHeader "apikey" cfg.apiKey withAuthorization
+
+
+getJson : Config -> String -> Array Param -> Decode.Decoder a -> Task Error a
+getJson cfg path params decoder =
+    HttpClient.get (buildUrl cfg path params)
+        |> withApiKeys cfg
+        |> HttpClient.expectJson decoder
+        |> HttpClient.send cfg.http
+        |> Task.mapError mapHttpError
+        |> Task.map .data
+
+
+{-| Post a JSON body and decode the response. `prefer` holds extra Prefer
+header values, such as `resolution=ignore-duplicates`.
+-}
+postJson : Config -> String -> Array Param -> Array String -> Encode.Value -> Decode.Decoder a -> Task Error a
+postJson cfg path params prefer body decoder =
+    Array.foldl
+        (\value request -> HttpClient.withHeader "Prefer" value request)
+        (HttpClient.post (buildUrl cfg path params))
+        prefer
+        |> withApiKeys cfg
+        |> HttpClient.withJsonBody body
+        |> HttpClient.expectJson decoder
+        |> HttpClient.send cfg.http
+        |> Task.mapError mapHttpError
+        |> Task.map .data
+
+
+{-| Delete rows matched by the filters. DELETE returns no body, so any
+response body is ignored.
+-}
+deleteRows : Config -> String -> Array Param -> Task Error {}
+deleteRows cfg path params =
+    HttpClient.request HttpServer.DELETE (buildUrl cfg path params)
+        |> withApiKeys cfg
+        |> HttpClient.expectAnything
+        |> HttpClient.send cfg.http
+        |> Task.mapError mapHttpError
+        |> Task.map (\_ -> {})
+
+
+rpc : Config -> String -> Encode.Value -> Decode.Decoder a -> Task Error a
+rpc cfg name args decoder =
+    postJson cfg ("/rpc/" ++ name) [] [] args decoder
+
+
+{-| Post a JSON body and ignore the response body, for endpoints that
+answer with an empty body (such as inserts without `return=representation`).
+-}
+postForEffect : Config -> String -> Array Param -> Array String -> Encode.Value -> Task Error {}
+postForEffect cfg path params prefer body =
+    Array.foldl
+        (\value request -> HttpClient.withHeader "Prefer" value request)
+        (HttpClient.post (buildUrl cfg path params))
+        prefer
+        |> withApiKeys cfg
+        |> HttpClient.withJsonBody body
+        |> HttpClient.expectAnything
+        |> HttpClient.send cfg.http
+        |> Task.mapError mapHttpError
+        |> Task.map (\_ -> {})
+
+
+{-| Call an RPC that returns one JSON value or `null`, such as
+`authenticate` and `verify_token`.
+-}
+rpcMaybe : Config -> String -> Encode.Value -> Decode.Decoder a -> Task Error (Maybe a)
+rpcMaybe cfg name args decoder =
+    rpc cfg name args (Decode.maybe decoder)
+
+
+
+-- Decoders
+
+
+decodeUser : Decode.Decoder User
+decodeUser =
+    Decode.map
+        (\id email username bio image -> { id = id, email = email, username = username, bio = bio, image = image })
+        (Decode.field "id" Decode.int)
+        |> Decode.andMap (Decode.field "email" Decode.string)
+        |> Decode.andMap (Decode.field "username" Decode.string)
+        |> Decode.andMap (Decode.field "bio" (Decode.nullable Decode.string))
+        |> Decode.andMap (Decode.field "image" (Decode.nullable Decode.string))
+
+
+{-| An RPC that returns `null` for a missing user sends
+`{"id":null,"email":null,...}` rather than JSON `null`, so the absent `id`
+marks the missing row.
+-}
+decodeMaybeUser : Decode.Decoder (Maybe User)
+decodeMaybeUser =
+    Decode.maybe (Decode.field "id" Decode.int)
+        |> Decode.andThen
+            (\maybeId ->
+                when maybeId is
+                    Just _ ->
+                        Decode.map Just decodeUser
+
+                    Nothing ->
+                        Decode.succeed Nothing
+            )
+
+
+decodeProfile : Decode.Decoder Profile
+decodeProfile =
+    Decode.map
+        (\username bio image following -> { username = username, bio = bio, image = image, following = following })
+        (Decode.field "username" Decode.string)
+        |> Decode.andMap (Decode.field "bio" (Decode.nullable Decode.string))
+        |> Decode.andMap (Decode.field "image" (Decode.nullable Decode.string))
+        |> Decode.andMap decodeFollowing
+
+
+{-| An RPC row that already computed `following`, such as the profile
+`set_following` returns.
+-}
+decodeProfileRow : Decode.Decoder Profile
+decodeProfileRow =
+    Decode.map
+        (\username bio image following -> { username = username, bio = bio, image = image, following = following })
+        (Decode.field "username" Decode.string)
+        |> Decode.andMap (Decode.field "bio" (Decode.nullable Decode.string))
+        |> Decode.andMap (Decode.field "image" (Decode.nullable Decode.string))
+        |> Decode.andMap (Decode.field "following" Decode.bool)
+
+
+{-| The `follows` embed is only requested for a known viewer. An absent or
+empty embed means "not following".
+-}
+decodeFollowing : Decode.Decoder Bool
+decodeFollowing =
+    Decode.map
+        (Maybe.withDefault [] >> Array.isEmpty >> not)
+        (Decode.maybe (Decode.field "follows" (Decode.array Decode.value)))
+
+
+decodeFavorited : Decode.Decoder Bool
+decodeFavorited =
+    Decode.map
+        (Maybe.withDefault [] >> Array.isEmpty >> not)
+        (Decode.maybe (Decode.field "myfavorites" (Decode.array Decode.value)))
+
+
+{-| The count embed comes back as `{"favorites":[{"count":3}]}`.
+-}
+decodeFavoritesCount : Decode.Decoder Int
+decodeFavoritesCount =
+    Decode.field "favorites"
+        (Decode.maybe (Decode.index 0 (Decode.field "count" Decode.int)))
+        |> Decode.map (Maybe.withDefault 0)
+
+
+decodeTagList : Decode.Decoder (Array String)
+decodeTagList =
+    Decode.map
+        (Maybe.withDefault [])
+        (Decode.maybe (Decode.field "article_tags" (Decode.array (Decode.field "tag" Decode.string))))
+
+
+decodeArticleSummary : Decode.Decoder ArticleSummary
+decodeArticleSummary =
+    Decode.map
+        (\slug title description tagList createdAt updatedAt favorited favoritesCount author ->
+            { slug = slug
+            , title = title
+            , description = description
+            , tagList = tagList
+            , createdAt = createdAt
+            , updatedAt = updatedAt
+            , favorited = favorited
+            , favoritesCount = favoritesCount
+            , author = author
+            }
+        )
+        (Decode.field "slug" Decode.string)
+        |> Decode.andMap (Decode.field "title" Decode.string)
+        |> Decode.andMap (Decode.field "description" Decode.string)
+        |> Decode.andMap decodeTagList
+        |> Decode.andMap (Decode.field "created_at" Decode.string)
+        |> Decode.andMap (Decode.field "updated_at" Decode.string)
+        |> Decode.andMap decodeFavorited
+        |> Decode.andMap decodeFavoritesCount
+        |> Decode.andMap (Decode.field "author" decodeProfile)
+
+
+decodeArticle : Decode.Decoder Article
+decodeArticle =
+    Decode.map
+        (\body summary -> { slug = summary.slug, title = summary.title, description = summary.description, body = body, tagList = summary.tagList, createdAt = summary.createdAt, updatedAt = summary.updatedAt, favorited = summary.favorited, favoritesCount = summary.favoritesCount, author = summary.author })
+        (Decode.field "body" Decode.string)
+        |> Decode.andMap decodeArticleSummary
+
+
+decodeComment : Decode.Decoder Comment
+decodeComment =
+    Decode.map
+        (\id createdAt updatedAt body author -> { id = id, createdAt = createdAt, updatedAt = updatedAt, body = body, author = author })
+        (Decode.field "id" Decode.int)
+        |> Decode.andMap (Decode.field "created_at" Decode.string)
+        |> Decode.andMap (Decode.field "updated_at" Decode.string)
+        |> Decode.andMap (Decode.field "body" Decode.string)
+        |> Decode.andMap (Decode.field "author" decodeProfile)
+
+
+{-| PostgREST answers a read with a JSON array of rows.
+-}
+firstRow : Decode.Decoder a -> Decode.Decoder (Maybe a)
+firstRow decoder =
+    Decode.map Array.first (Decode.array decoder)
+
+
+expectRow : String -> Maybe a -> Task Error a
+expectRow what maybeRow =
+    when maybeRow is
+        Just row ->
+            Task.succeed row
+
+        Nothing ->
+            Task.fail (UnexpectedBody ("expected one " ++ what ++ " row"))
+
+
+
+-- Users and authentication
+
+
+registerUser : Config -> { username : String, email : String, password : String } -> Task Error User
+registerUser cfg args =
+    rpc cfg "register_user"
+        (Encode.object
+            [ { key = "p_username", value = Encode.string args.username }
+            , { key = "p_email", value = Encode.string args.email }
+            , { key = "p_password", value = Encode.string args.password }
+            ]
+        )
+        decodeUser
+
+
+{-| Check the password with the database hash. `Nothing` means unknown
+email or wrong password.
+-}
+authenticate : Config -> { email : String, password : String } -> Task Error (Maybe User)
+authenticate cfg args =
+    rpcMaybe cfg "authenticate"
+        (Encode.object
+            [ { key = "p_email", value = Encode.string args.email }
+            , { key = "p_password", value = Encode.string args.password }
+            ]
+        )
+        decodeUser
+
+
+{-| Check a token's signature and expiry, then load the user it names.
+-}
+verifyToken : Config -> String -> Task Error (Maybe User)
+verifyToken cfg token =
+    rpcMaybe cfg "verify_token"
+        (Encode.object [ { key = "p_token", value = Encode.string token } ])
+        decodeUser
+
+
+createToken : Config -> { userId : Int, email : String, username : String } -> Task Error String
+createToken cfg args =
+    rpc cfg "create_token"
+        (Encode.object
+            [ { key = "p_user_id", value = Encode.int args.userId }
+            , { key = "p_email", value = Encode.string args.email }
+            , { key = "p_username", value = Encode.string args.username }
+            ]
+        )
+        Decode.string
+
+
+{-| Apply a patch to the current user. A present key means "change this
+field"; `null` as its value means "store null". The `password` key holds the
+raw password, which the database hashes.
+-}
+updateUser : Config -> { userId : Int, patch : Array Patch } -> Task Error User
+updateUser cfg args =
+    rpc cfg "update_user"
+        (Encode.object
+            [ { key = "p_user_id", value = Encode.int args.userId }
+            , { key = "p_patch", value = Encode.object args.patch }
+            ]
+        )
+        decodeUser
+
+
+
+-- Profiles
+
+
+getProfile : Config -> { username : String, viewerId : Maybe Int } -> Task Error (Maybe Profile)
+getProfile cfg args =
+    getJson cfg "/users"
+        (Array.append
+            [ eq "username" args.username ]
+            (viewerProfileParams args.viewerId)
+        )
+        (firstRow decodeProfile)
+
+
+{-| The `select` and filters that turn a `users` row into a RealWorld
+profile: the public columns, plus the viewer's follow.
+-}
+viewerProfileParams : Maybe Int -> Array Param
+viewerProfileParams maybeViewerId =
+    when maybeViewerId is
+        Just viewerId ->
+            [ param "select" "username,bio,image,follows!follows_followee_fk(follower_id)"
+            , param "follows.follower_id" ("eq." ++ String.fromInt viewerId)
+            ]
+
+        Nothing ->
+            [ param "select" "username,bio,image" ]
+
+
+{-| Follow or unfollow a user, and return the resulting profile.
+-}
+setFollowing : Config -> { username : String, viewerId : Int, follow : Bool } -> Task Error Profile
+setFollowing cfg args =
+    rpc cfg "set_following"
+        (Encode.object
+            [ { key = "p_username", value = Encode.string args.username }
+            , { key = "p_viewer_id", value = Encode.int args.viewerId }
+            , { key = "p_follow", value = Encode.bool args.follow }
+            ]
+        )
+        (Decode.index 0 decodeProfileRow)
+
+
+
+-- Articles
+
+
+{-| The article columns every read shares. The single-article endpoints set
+`includeBody`; the list and feed endpoints leave the body out. With a
+viewer, the author embed carries a `follows` embed filtered to the viewer,
+and the favorites split into a count plus "did the viewer favorite this".
+-}
+articleSelect : { viewerId : Maybe Int, includeBody : Bool } -> Array Param
+articleSelect args =
+    let
+        bodyColumn =
+            if args.includeBody then
+                "body,"
+
+            else
+                ""
+
+        authorEmbed =
+            when args.viewerId is
+                Just _ ->
+                    "author:users!articles_author_fk(username,bio,image,follows!follows_followee_fk(follower_id))"
+
+                Nothing ->
+                    "author:users!articles_author_fk(username,bio,image)"
+
+        embeds =
+            when args.viewerId is
+                Just viewerId ->
+                    [ param "author.follows.follower_id" ("eq." ++ String.fromInt viewerId)
+                    , param "myfavorites.user_id" ("eq." ++ String.fromInt viewerId)
+                    ]
+
+                Nothing ->
+                    []
+
+        myFavorites =
+            when args.viewerId is
+                Just _ ->
+                    ",myfavorites:favorites(user_id)"
+
+                Nothing ->
+                    ""
+
+        select =
+            "slug,title,description,"
+                ++ bodyColumn
+                ++ "created_at,updated_at,"
+                ++ authorEmbed
+                ++ ",favorites(count)"
+                ++ myFavorites
+                ++ ",article_tags(tag)"
+    in
+    Array.append
+        [ param "select" select
+        , param "article_tags.order" "position.asc"
+        ]
+        embeds
+
+
+{-| A filter that needs a join: an extra (empty or narrowed) embed added to
+`select`, plus the filter parameter that targets it. The `!inner` makes the
+filter narrow the articles themselves.
+-}
+type alias ViewFilter =
+    { embed : String
+    , filter : Param
+    }
+
+
+tagFilter : String -> ViewFilter
+tagFilter tag =
+    { embed = "tagsf:article_tags!inner()"
+    , filter = param "tagsf.tag" ("eq." ++ tag)
+    }
+
+
+authorFilter : String -> ViewFilter
+authorFilter author =
+    { embed = "authorf:users!articles_author_fk!inner(id)"
+    , filter = param "authorf.username" ("eq." ++ author)
+    }
+
+
+{-| Articles favorited by a named user: the favorites embed reaches through
+to the users table to filter on the username.
+-}
+favoritedFilter : String -> ViewFilter
+favoritedFilter username =
+    { embed = "favf:favorites!inner(user:users!favorites_user_fk(username))"
+    , filter = param "favf.user.username" ("eq." ++ username)
+    }
+
+
+{-| Articles by authors the viewer follows. The embed is the
+`author_followers` computed relationship, because no foreign key joins
+articles to follows directly.
+-}
+feedFilter : Int -> ViewFilter
+feedFilter viewerId =
+    { embed = "author_followers!inner(follower_id)"
+    , filter = param "author_followers.follower_id" ("eq." ++ String.fromInt viewerId)
+    }
+
+
+applyFilter : Maybe ViewFilter -> Array Param -> Array Param
+applyFilter maybeFilter params =
+    when maybeFilter is
+        Just viewFilter ->
+            params
+                |> Array.map
+                    (\entry ->
+                        if entry.key == "select" then
+                            { entry | value = entry.value ++ "," ++ viewFilter.embed }
+
+                        else
+                            entry
+                    )
+                |> \extended -> Array.pushLast viewFilter.filter extended
+
+        Nothing ->
+            params
+
+
+pageParams : { limit : Int, offset : Int } -> Array Param
+pageParams args =
+    [ param "order" "created_at.desc,id.desc"
+    , param "limit" (String.fromInt args.limit)
+    , param "offset" (String.fromInt args.offset)
+    ]
+
+
+getArticle : Config -> { slug : String, viewerId : Maybe Int } -> Task Error (Maybe Article)
+getArticle cfg args =
+    getJson cfg "/articles"
+        (Array.append
+            [ eq "slug" args.slug ]
+            (articleSelect { viewerId = args.viewerId, includeBody = True })
+        )
+        (firstRow decodeArticle)
+
+
+listArticles : Config -> ListArticlesQuery -> Task Error ArticlePage
+listArticles cfg query =
+    let
+        rowsParams =
+            articleSelect { viewerId = query.viewerId, includeBody = False }
+                |> applyFilter (Maybe.map tagFilter query.tag)
+                |> applyFilter (Maybe.map authorFilter query.author)
+                |> applyFilter (Maybe.map favoritedFilter query.favorited)
+                |> (\base -> Array.append base (pageParams { limit = query.limit, offset = query.offset }))
+
+        rowsTask =
+            getJson cfg "/articles" rowsParams (Decode.array decodeArticleSummary)
+
+        countTask =
+            rpc cfg "count_articles" (countArgs query) Decode.int
+    in
+    Task.map2
+        (\articles count -> { articles = articles, count = count })
+        rowsTask
+        countTask
+
+
+countArgs : ListArticlesQuery -> Encode.Value
+countArgs query =
+    Encode.object
+        (Array.mapAndKeepJust
+            identity
+            [ Maybe.map (\tag -> { key = "p_tag", value = Encode.string tag }) query.tag
+            , Maybe.map (\author -> { key = "p_author", value = Encode.string author }) query.author
+            , Maybe.map (\name -> { key = "p_favorited_by", value = Encode.string name }) query.favorited
+            ]
+        )
+
+
+listFeed : Config -> { viewerId : Int, limit : Int, offset : Int } -> Task Error ArticlePage
+listFeed cfg args =
+    let
+        rowsParams =
+            articleSelect { viewerId = Just args.viewerId, includeBody = False }
+                |> applyFilter (Just (feedFilter args.viewerId))
+                |> (\base -> Array.append base (pageParams { limit = args.limit, offset = args.offset }))
+
+        rowsTask =
+            getJson cfg "/articles" rowsParams (Decode.array decodeArticleSummary)
+
+        countTask =
+            rpc cfg "count_articles"
+                (Encode.object [ { key = "p_followed_by", value = Encode.int args.viewerId } ])
+                Decode.int
+    in
+    Task.map2
+        (\articles count -> { articles = articles, count = count })
+        rowsTask
+        countTask
+
+
+{-| Create an article with a database-generated slug, then read it back.
+-}
+createArticle : Config -> { authorId : Int, title : String, description : String, body : String, tagList : Array String } -> Task Error Article
+createArticle cfg args =
+    rpc cfg "create_article"
+        (Encode.object
+            [ { key = "p_author_id", value = Encode.int args.authorId }
+            , { key = "p_title", value = Encode.string args.title }
+            , { key = "p_description", value = Encode.string args.description }
+            , { key = "p_body", value = Encode.string args.body }
+            , { key = "p_tags", value = Encode.array Encode.string args.tagList }
+            ]
+        )
+        Decode.string
+        |> Task.andThen
+            (\slug ->
+                getArticle cfg { slug = slug, viewerId = Just args.authorId }
+                    |> Task.andThen (expectRow "article")
+            )
+
+
+{-| Update an article as its author. Present patch keys change, absent keys
+stay, and `tagList` replaces the tags. Returns the updated article.
+-}
+updateArticle : Config -> { slug : String, requesterId : Int, patch : Array Patch, tagList : Maybe (Array String) } -> Task Error Article
+updateArticle cfg args =
+    let
+        patches =
+            when args.tagList is
+                Just tags ->
+                    Array.pushLast { key = "tagList", value = Encode.array Encode.string tags } args.patch
+
+                Nothing ->
+                    args.patch
+    in
+    rpc cfg "update_article"
+        (Encode.object
+            [ { key = "p_slug", value = Encode.string args.slug }
+            , { key = "p_requester_id", value = Encode.int args.requesterId }
+            , { key = "p_patch", value = Encode.object patches }
+            ]
+        )
+        Decode.string
+        |> Task.andThen
+            (\slug ->
+                getArticle cfg { slug = slug, viewerId = Just args.requesterId }
+                    |> Task.andThen (expectRow "article")
+            )
+
+
+deleteArticle : Config -> { slug : String, requesterId : Int } -> Task Error {}
+deleteArticle cfg args =
+    articleIdAndAuthor cfg args.slug
+        |> Task.andThen
+            (\found ->
+                when found.authorId == args.requesterId is
+                    True ->
+                        deleteRows cfg "/articles" [ eq "id" (String.fromInt found.id) ]
+
+                    False ->
+                        Task.fail ArticleForbidden
+            )
+
+
+favoriteArticle : Config -> { slug : String, viewerId : Int } -> Task Error Article
+favoriteArticle cfg args =
+    articleIdAndAuthor cfg args.slug
+        |> Task.andThen
+            (\found ->
+                postForEffect cfg "/favorites"
+                    [ param "on_conflict" "user_id,article_id" ]
+                    [ "resolution=ignore-duplicates" ]
+                    (Encode.array
+                        identity
+                        [ Encode.object
+                            [ { key = "user_id", value = Encode.int args.viewerId }
+                            , { key = "article_id", value = Encode.int found.id }
+                            ]
+                        ]
+                    )
+            )
+        |> Task.andThen (\_ -> reloadArticle cfg args)
+
+
+unfavoriteArticle : Config -> { slug : String, viewerId : Int } -> Task Error Article
+unfavoriteArticle cfg args =
+    articleIdAndAuthor cfg args.slug
+        |> Task.andThen
+            (\found ->
+                deleteRows cfg "/favorites"
+                    [ eq "user_id" (String.fromInt args.viewerId)
+                    , eq "article_id" (String.fromInt found.id)
+                    ]
+            )
+        |> Task.andThen (\_ -> reloadArticle cfg args)
+
+
+reloadArticle : Config -> { slug : String, viewerId : Int } -> Task Error Article
+reloadArticle cfg args =
+    getArticle cfg { slug = args.slug, viewerId = Just args.viewerId }
+        |> Task.andThen (expectRow "article")
+
+
+type alias FoundArticle =
+    { id : Int
+    , authorId : Int
+    }
+
+
+articleIdAndAuthor : Config -> String -> Task Error FoundArticle
+articleIdAndAuthor cfg slug =
+    getJson cfg "/articles"
+        [ eq "slug" slug, param "select" "id,author_id" ]
+        (firstRow
+            (Decode.map
+                (\id authorId -> { id = id, authorId = authorId })
+                (Decode.field "id" Decode.int)
+                |> Decode.andMap (Decode.field "author_id" Decode.int)
+            )
+        )
+        |> Task.andThen
+            (\maybeFound ->
+                when maybeFound is
+                    Just found ->
+                        Task.succeed found
+
+                    Nothing ->
+                        Task.fail ArticleNotFound
+            )
+
+
+
+-- Comments
+
+
+commentSelect : Maybe Int -> Array Param
+commentSelect maybeViewerId =
+    when maybeViewerId is
+        Just viewerId ->
+            [ param "select" "id,body,created_at,updated_at,author:users!comments_author_fk(username,bio,image,follows!follows_followee_fk(follower_id))"
+            , param "author.follows.follower_id" ("eq." ++ String.fromInt viewerId)
+            ]
+
+        Nothing ->
+            [ param "select" "id,body,created_at,updated_at,author:users!comments_author_fk(username,bio,image)" ]
+
+
+{-| Add a comment and get the full row, with the author profile, back from
+the same request.
+-}
+addComment : Config -> { slug : String, authorId : Int, body : String } -> Task Error Comment
+addComment cfg args =
+    articleIdAndAuthor cfg args.slug
+        |> Task.andThen
+            (\found ->
+                postJson cfg "/comments"
+                    (commentSelect (Just args.authorId))
+                    [ "return=representation" ]
+                    (Encode.object
+                        [ { key = "article_id", value = Encode.int found.id }
+                        , { key = "author_id", value = Encode.int args.authorId }
+                        , { key = "body", value = Encode.string args.body }
+                        ]
+                    )
+                    (Decode.index 0 decodeComment)
+            )
+
+
+{-| All comments on an article, oldest first. `Nothing` means the article
+does not exist.
+-}
+listComments : Config -> { slug : String, viewerId : Maybe Int } -> Task Error (Maybe (Array Comment))
+listComments cfg args =
+    articleIdAndAuthorMaybe cfg args.slug
+        |> Task.andThen
+            (\maybeFound ->
+                when maybeFound is
+                    Just found ->
+                        getJson cfg "/comments"
+                            (Array.append
+                                [ eq "article_id" (String.fromInt found.id)
+                                , param "order" "created_at.asc,id.asc"
+                                ]
+                                (commentSelect args.viewerId)
+                            )
+                            (Decode.array decodeComment)
+                            |> Task.map Just
+
+                    Nothing ->
+                        Task.succeed Nothing
+            )
+
+
+deleteComment : Config -> { slug : String, commentId : Int, requesterId : Int } -> Task Error {}
+deleteComment cfg args =
+    articleIdAndAuthor cfg args.slug
+        |> Task.andThen
+            (\found ->
+                getJson cfg "/comments"
+                    [ eq "id" (String.fromInt args.commentId)
+                    , eq "article_id" (String.fromInt found.id)
+                    , param "select" "author_id"
+                    ]
+                    (firstRow (Decode.field "author_id" Decode.int))
+                    |> Task.andThen
+                        (\maybeAuthorId ->
+                            when maybeAuthorId is
+                                Just authorId ->
+                                    if authorId == args.requesterId then
+                                        deleteRows cfg "/comments" [ eq "id" (String.fromInt args.commentId) ]
+
+                                    else
+                                        Task.fail CommentForbidden
+
+                                Nothing ->
+                                    Task.fail CommentNotFound
+                        )
+            )
+
+
+articleIdAndAuthorMaybe : Config -> String -> Task Error (Maybe FoundArticle)
+articleIdAndAuthorMaybe cfg slug =
+    getJson cfg "/articles"
+        [ eq "slug" slug, param "select" "id,author_id" ]
+        (firstRow
+            (Decode.map
+                (\id authorId -> { id = id, authorId = authorId })
+                (Decode.field "id" Decode.int)
+                |> Decode.andMap (Decode.field "author_id" Decode.int)
+            )
+        )
+
+
+
+-- Tags
+
+
+{-| Every tag in use, sorted, without duplicates. PostgREST has no SELECT
+DISTINCT, so the duplicates fall out here after the sorted fetch.
+-}
+listTags : Config -> Task Error (Array String)
+listTags cfg =
+    getJson cfg "/article_tags"
+        [ param "select" "tag"
+        , param "order" "tag.asc"
+        ]
+        (Decode.array (Decode.field "tag" Decode.string))
+        |> Task.map dropConsecutiveDuplicates
+
+
+dropConsecutiveDuplicates : Array String -> Array String
+dropConsecutiveDuplicates tags =
+    Array.foldl
+        (\tag acc ->
+            when Array.last acc is
+                Just last ->
+                    if last == tag then
+                        acc
+
+                    else
+                        Array.pushLast tag acc
+
+                Nothing ->
+                    Array.pushLast tag acc
+        )
+        []
+        tags

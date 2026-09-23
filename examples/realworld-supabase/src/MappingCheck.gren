@@ -1,0 +1,212 @@
+module MappingCheck exposing (main)
+
+{-| A runnable check for the Grenite.Data prototype. It decodes sample
+PostgREST rows through the article mappings, encodes a sample record, and
+prints the generated select list. Run it from examples/realworld-supabase:
+
+    gren make MappingCheck --output=build/check.js
+    node build/check.js && cat build/check-output.txt
+
+Delete this module when the prototype settles.
+
+-}
+
+import Array exposing (Array)
+import Bytes
+import Data.Article exposing (ArticleV3, articleV3, buildArticleV3)
+import Data.Profile exposing (buildProfileV1)
+import FileSystem
+import FileSystem.Path
+import Grenite.Data exposing (Mapping, Storage(..))
+import Init
+import Json.Decode as Decode
+import Json.Encode as Encode
+import Node
+import Task exposing (Task)
+
+
+main : Node.SimpleProgram {}
+main =
+    Node.defineSimpleProgram
+        (\_ ->
+            Init.await FileSystem.initialize
+                (\fileSystem ->
+                    Node.endSimpleProgram (runChecks fileSystem)
+                )
+        )
+
+
+runChecks : FileSystem.Permission -> Task Never {}
+runChecks fileSystem =
+    let
+        report =
+            String.join "\n" lines
+                ++ "\n"
+    in
+    FileSystem.writeFile
+        fileSystem
+        (Bytes.fromString report)
+        (FileSystem.Path.fromPosixString "build/check-output.txt")
+            |> Task.map (\_ -> {})
+            |> Task.onError (\_ -> Task.succeed {})
+
+
+lines : Array String
+lines =
+    [ checkDecode "v3" articleV3 rowV3
+    , checkDecode "v2 upgraded" articleV3 rowV2
+    , checkBadDecode
+    , checkMissingStamp
+    , checkEncode
+    , checkSelectList
+    ]
+
+
+rowV3 : String
+rowV3 =
+    """
+{"id":42,"schema_version":3,"slug":"how-to-train-your-dragon","title":"How to train your dragon","description":"Ever wonder how?","body":"It takes a Jacobian","article_tags":[{"tag":"dragons","position":0},{"tag":"training","position":1}],"created_at":"2016-02-18T03:22:56.637Z","updated_at":"2016-02-18T03:48:35.824Z","favorites":[{"user_id":7}],"author":{"id":7,"schema_version":1,"username":"jake","bio":"I work at statefarm","image":null,"follows":[{"follower_id":9}]}}
+"""
+
+
+rowV2 : String
+rowV2 =
+    """
+{"id":42,"schema_version":2,"slug":"how-to-train-your-dragon","title":"How to train your dragon","description":"Ever wonder how?","body":"It takes a Jacobian","tags_csv":"dragons,training","created_at":"2016-02-18T03:22:56.637Z","updated_at":"2016-02-18T03:48:35.824Z","favorites":[{"user_id":7}],"author":{"id":7,"schema_version":1,"username":"jake","bio":"I work at statefarm","image":null}}
+"""
+
+
+checkDecode : String -> Mapping ArticleV3 -> String -> String
+checkDecode label mapping_ rowJson =
+    let
+        result =
+            Decode.decodeString Decode.value rowJson
+                |> Result.andThen (\row -> Grenite.Data.decode mapping_ row)-- |> Result.mapError Decode.errorToString
+    in
+    when result is
+        Ok record ->
+            label
+                ++ " OK: slug="
+                ++ record.slug
+                ++ " tags="
+                ++ String.fromInt (Array.length record.tagList)
+                ++ " favorited="
+                ++ boolString record.favorited
+                ++ " favoritesCount="
+                ++ String.fromInt record.favoritesCount
+                ++ " author="
+                ++ record.author.username
+                ++ " following="
+                ++ boolString record.author.following
+
+        Err error ->
+            label ++ " FAIL: " ++ Decode.errorToString error
+
+
+checkBadDecode : String
+checkBadDecode =
+    let
+        result =
+            Decode.decodeString Decode.value rowMissingSlug
+                |> Result.andThen (\row -> Grenite.Data.decode articleV3 row)
+                |> Result.mapError Decode.errorToString
+    in
+    when result is
+        Ok _ ->
+            "bad decode FAIL: row decoded"
+
+        Err message ->
+            "bad decode OK: " ++ message
+
+
+checkMissingStamp : String
+checkMissingStamp =
+    let
+        result =
+            Decode.decodeString Decode.value rowMissingStamp
+                |> Result.andThen (\row -> Grenite.Data.decode articleV3 row)
+                |> Result.mapError Decode.errorToString
+    in
+    when result is
+        Ok _ ->
+            "missing stamp FAIL: row decoded"
+
+        Err message ->
+            "missing stamp OK: " ++ message
+
+
+rowMissingSlug : String
+rowMissingSlug =
+    """
+{"id":42,"schema_version":3,"title":"T","description":"D","body":"B","article_tags":[],"created_at":"c","updated_at":"u","favorites":[],"author":{"id":7,"schema_version":1,"username":"jake","bio":null,"image":null}}
+"""
+
+
+rowMissingStamp : String
+rowMissingStamp =
+    """
+{"id":42,"slug":"s","title":"T","description":"D","body":"B","article_tags":[],"created_at":"c","updated_at":"u","favorites":[],"author":{"id":7,"schema_version":1,"username":"jake","bio":null,"image":null}}
+"""
+
+
+checkEncode : String
+checkEncode =
+    let
+        author =
+            buildProfileV1 "jake" (Just "I work at statefarm") Nothing False
+
+        sample =
+            buildArticleV3
+                "test-slug"
+                "Title"
+                "Description"
+                "Body"
+                [ "a", "b" ]
+                "2026-01-01T00:00:00Z"
+                "2026-01-02T00:00:00Z"
+                False
+                0
+                author
+    in
+    "encode: " ++ Encode.encode 0 (Grenite.Data.encode articleV3 sample)
+
+
+checkSelectList : String
+checkSelectList =
+    "select list: "
+        ++ (Grenite.Data.toLayout articleV3
+                |> .fields
+                |> Array.map (\field -> field.id ++ " -> " ++ storageString field.storage)
+                |> String.join ", "
+           )
+
+
+storageString : Storage -> String
+storageString storage =
+    when storage is
+        KeyColumn column ->
+            "key " ++ column
+
+        Column column ->
+            "column " ++ column
+
+        BlobPart blob ->
+            "blob " ++ blob.column ++ "." ++ blob.key
+
+        ChildRows child ->
+            "childRows " ++ child.table
+
+        Embedded embed ->
+            "embedded " ++ embed.table
+
+        Computed ->
+            "computed"
+
+
+boolString : Bool -> String
+boolString value =
+    if value then
+        "true"
+
+    else
+        "false"

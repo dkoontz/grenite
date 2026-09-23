@@ -1,0 +1,355 @@
+module UsersApi exposing (routes)
+
+import Array exposing (Array)
+import Grenite
+import Grenite.Helpers as Helpers
+import Grenite.Http as Http
+import Grenite.RouteParser as RouteParser
+import Grenite.Types exposing (Request, Response, RouteHandler)
+import HttpServer
+import Json.Decode as Decode
+import Json.Encode as Encode
+import Shared exposing (AppModel, Error, FieldError)
+import Supabase exposing (User)
+import Task exposing (Task)
+
+
+routes : Array (RouteHandler AppModel Error)
+routes =
+    Array.append
+        [ registerRoute
+        , loginRoute
+        , currentUserRoute
+        , updateUserRoute
+        ]
+        (Array.map Shared.optionsRoute [ "/api/users", "/api/users/login", "/api/user" ])
+
+
+
+-- Request and response shapes
+
+
+type alias RegisterUser =
+    { username : Maybe String
+    , email : Maybe String
+    , password : Maybe String
+    }
+
+
+type alias LoginUser =
+    { email : Maybe String
+    , password : Maybe String
+    }
+
+
+{-| Fields accepted by `PUT /api/user`. Each field distinguishes absent
+(`Nothing`), explicit `null` (`Just Nothing`), and a value (`Just (Just v)`)
+so the handler can apply the RealWorld rules: email and username may not be
+blank or null, password must be at least 8 characters when present, bio and
+image accept null and normalize a blank string to null.
+-}
+type alias UpdateUserBody =
+    { email : Maybe (Maybe String)
+    , username : Maybe (Maybe String)
+    , password : Maybe (Maybe String)
+    , bio : Maybe (Maybe String)
+    , image : Maybe (Maybe String)
+    }
+
+
+type alias UserResponse =
+    { user : User
+    , token : String
+    }
+
+
+decodeRegisterUser : Decode.Decoder RegisterUser
+decodeRegisterUser =
+    Decode.map3
+        (\username email password -> { username = username, email = email, password = password })
+        (Decode.field "user" (Decode.map Shared.flatten (Shared.optionalField "username" Decode.string)))
+        (Decode.field "user" (Decode.map Shared.flatten (Shared.optionalField "email" Decode.string)))
+        (Decode.field "user" (Decode.map Shared.flatten (Shared.optionalField "password" Decode.string)))
+
+decodeLoginUser : Decode.Decoder LoginUser
+decodeLoginUser =
+    Decode.map2
+        (\email password -> { email = email, password = password })
+        (Decode.field "user" (Decode.map Shared.flatten (Shared.optionalField "email" Decode.string)))
+        (Decode.field "user" (Decode.map Shared.flatten (Shared.optionalField "password" Decode.string)))
+
+decodeUpdateUserBody : Decode.Decoder UpdateUserBody
+decodeUpdateUserBody =
+    Decode.map
+        (\email username password bio image ->
+            { email = email
+            , username = username
+            , password = password
+            , bio = bio
+            , image = image
+            }
+        )
+        (Decode.field "user" (Shared.optionalField "email" Decode.string))
+        |> Decode.andMap (Decode.field "user" (Shared.optionalField "username" Decode.string))
+        |> Decode.andMap (Decode.field "user" (Shared.optionalField "password" Decode.string))
+        |> Decode.andMap (Decode.field "user" (Shared.optionalField "bio" Decode.string))
+        |> Decode.andMap (Decode.field "user" (Shared.optionalField "image" Decode.string))
+
+encodeUserResponse : UserResponse -> Encode.Value
+encodeUserResponse response =
+    Encode.object
+        [ { key = "user"
+          , value =
+                Encode.object
+                    [ { key = "email", value = Encode.string response.user.email }
+                    , { key = "token", value = Encode.string response.token }
+                    , { key = "username", value = Encode.string response.user.username }
+                    , { key = "bio", value = Shared.encodeMaybe Encode.string response.user.bio }
+                    , { key = "image", value = Shared.encodeMaybe Encode.string response.user.image }
+                    ]
+          }
+        ]
+
+
+
+-- Routes
+
+
+registerRoute : RouteHandler AppModel Error
+registerRoute =
+    Grenite.createRoute
+        { method = HttpServer.POST
+        , route = RouteParser.defineRoute "/api/users" RouteParser.noParams
+        , requestDecoder = Helpers.jsonRequestBodyDecoder decodeRegisterUser
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeUserResponse
+        , handler = registerHandler
+        }
+
+
+loginRoute : RouteHandler AppModel Error
+loginRoute =
+    Grenite.createRoute
+        { method = HttpServer.POST
+        , route = RouteParser.defineRoute "/api/users/login" RouteParser.noParams
+        , requestDecoder = Helpers.jsonRequestBodyDecoder decodeLoginUser
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeUserResponse
+        , handler = loginHandler
+        }
+
+
+currentUserRoute : RouteHandler AppModel Error
+currentUserRoute =
+    Grenite.createRoute
+        { method = HttpServer.GET
+        , route = RouteParser.defineRoute "/api/user" RouteParser.noParams
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeUserResponse
+        , handler = currentUserHandler
+        }
+
+
+updateUserRoute : RouteHandler AppModel Error
+updateUserRoute =
+    Grenite.createRoute
+        { method = HttpServer.PUT
+        , route = RouteParser.defineRoute "/api/user" RouteParser.noParams
+        , requestDecoder = Helpers.jsonRequestBodyDecoder decodeUpdateUserBody
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeUserResponse
+        , handler = updateUserHandler
+        }
+
+
+
+-- Handlers
+
+
+registerHandler : AppModel -> Request Helpers.NoRouteParams RegisterUser -> Task Error (Response UserResponse)
+registerHandler model request =
+    Shared.fromFieldErrors
+        (Array.foldl Array.append []
+            [ Shared.blankErrors "username" request.body.username
+            , Shared.blankErrors "email" request.body.email
+            , Shared.blankErrors "password" request.body.password
+            , Shared.minLengthErrors 8 "password" request.body.password
+            ]
+        )
+        |> Task.andThen (\_ -> insertUser model.config request.body)
+        |> Task.andThen (withToken model.config)
+        |> Task.map (\body -> { status = 201, body = body, headers = Shared.jsonHeaders })
+
+
+{-| The database hashes the password as it inserts the row, so the app
+never sees a hash.
+-}
+insertUser : Supabase.Config -> RegisterUser -> Task Error User
+insertUser config body =
+    Supabase.registerUser config
+        { username = Maybe.withDefault "" body.username
+        , email = Maybe.withDefault "" body.email
+        , password = Maybe.withDefault "" body.password
+        }
+        |> Task.mapError Shared.supabaseError
+
+
+loginHandler : AppModel -> Request Helpers.NoRouteParams LoginUser -> Task Error (Response UserResponse)
+loginHandler model request =
+    Shared.fromFieldErrors
+        (Array.foldl Array.append []
+            [ Shared.blankErrors "email" request.body.email
+            , Shared.blankErrors "password" request.body.password
+            ]
+        )
+        |> Task.andThen (\_ -> authenticate model.config request.body)
+        |> Task.andThen (withToken model.config)
+        |> Task.map (\body -> { status = 200, body = body, headers = Shared.jsonHeaders })
+
+
+{-| The database compares the password against the stored hash. `Nothing`
+covers both an unknown email and a wrong password.
+-}
+authenticate : Supabase.Config -> LoginUser -> Task Error User
+authenticate config body =
+    Supabase.authenticate config
+        { email = Maybe.withDefault "" body.email
+        , password = Maybe.withDefault "" body.password
+        }
+        |> Task.mapError Shared.supabaseError
+        |> Task.andThen
+            (\maybeUser ->
+                when maybeUser is
+                    Just user ->
+                        Task.succeed user
+
+                    Nothing ->
+                        Task.fail Shared.InvalidCredentials
+            )
+
+
+currentUserHandler : AppModel -> Request Helpers.NoRouteParams Helpers.EmptyRequestBody -> Task Error (Response UserResponse)
+currentUserHandler model request =
+    Shared.requireUser model.config (Shared.tokenFromRequest request)
+        |> Task.andThen (withToken model.config)
+        |> Task.map (\body -> { status = 200, body = body, headers = Shared.jsonHeaders })
+
+
+withToken : Supabase.Config -> User -> Task Error UserResponse
+withToken config user =
+    Supabase.createToken config
+        { userId = user.id
+        , email = user.email
+        , username = user.username
+        }
+        |> Task.mapError Shared.supabaseError
+        |> Task.map (\token -> { user = user, token = token })
+
+
+updateUserHandler : AppModel -> Request Helpers.NoRouteParams UpdateUserBody -> Task Error (Response UserResponse)
+updateUserHandler model request =
+    Shared.requireUser model.config (Shared.tokenFromRequest request)
+        |> Task.andThen (\user -> validateAndUpdate model.config user.id request.body)
+        |> Task.andThen (withToken model.config)
+        |> Task.map (\body -> { status = 200, body = body, headers = Shared.jsonHeaders })
+
+
+validateAndUpdate : Supabase.Config -> Int -> UpdateUserBody -> Task Error User
+validateAndUpdate config userId body =
+    Shared.fromFieldErrors (updateUserChecks body)
+        |> Task.andThen (\_ -> buildUserPatches body)
+        |> Task.andThen
+            (\patches ->
+                Supabase.updateUser config { userId = userId, patch = patches }
+                    |> Task.mapError Shared.supabaseError
+            )
+
+
+updateUserChecks : UpdateUserBody -> Array FieldError
+updateUserChecks body =
+    Array.foldl Array.append []
+        [ requiredText "email" body.email
+        , requiredText "username" body.username
+        , requiredPassword body.password
+        ]
+
+
+{-| Errors for a field that is fine to omit, but must not be blank or null
+when present.
+-}
+requiredText : String -> Maybe (Maybe String) -> Array FieldError
+requiredText field maybeValue =
+    when maybeValue is
+        Nothing ->
+            []
+
+        Just Nothing ->
+            [ { field = field, messages = [ "can't be blank" ] } ]
+
+        Just (Just value) ->
+            Shared.blankErrors field (Just value)
+
+
+requiredPassword : Maybe (Maybe String) -> Array FieldError
+requiredPassword maybeValue =
+    when maybeValue is
+        Nothing ->
+            []
+
+        Just Nothing ->
+            [ { field = "password", messages = [ "can't be blank" ] } ]
+
+        Just (Just value) ->
+            Array.append
+                (Shared.blankErrors "password" (Just value))
+                (Shared.minLengthErrors 8 "password" (Just value))
+
+
+{-| The patch keys for `update_user`. The raw password travels under the
+`password` key and the database hashes it.
+-}
+buildUserPatches : UpdateUserBody -> Task Error (Array Supabase.Patch)
+buildUserPatches body =
+    let
+        patches =
+            Array.foldl Array.append []
+                [ Shared.setPatch "email" body.email
+                , Shared.setPatch "username" body.username
+                , normalizePatch "bio" body.bio
+                , normalizePatch "image" body.image
+                ]
+    in
+    when body.password is
+        Nothing ->
+            Task.succeed patches
+
+        Just _ ->
+            Task.succeed
+                (Array.pushLast
+                    { key = "password", value = Encode.string (Maybe.withDefault "" (Shared.flatten body.password)) }
+                    patches
+                )
+
+
+{-| A patch for a nullable text field: a present blank string normalizes to
+null, matching the RealWorld bio and image rules.
+-}
+normalizePatch : String -> Maybe (Maybe String) -> Array Supabase.Patch
+normalizePatch field maybeValue =
+    when maybeValue is
+        Nothing ->
+            []
+
+        Just inner ->
+            [ { key = field, value = normalizedValue inner } ]
+
+
+normalizedValue : Maybe String -> Encode.Value
+normalizedValue inner =
+    when inner is
+        Nothing ->
+            Encode.null
+
+        Just value ->
+            if String.isEmpty (String.trim value) then
+                Encode.null
+
+            else
+                Encode.string value

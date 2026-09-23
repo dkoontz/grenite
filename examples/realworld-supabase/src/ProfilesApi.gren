@@ -1,0 +1,148 @@
+module ProfilesApi exposing (routes)
+
+import Array exposing (Array)
+import Grenite
+import Grenite.Helpers as Helpers
+import Grenite.Http as Http
+import Grenite.RouteParser as RouteParser
+import Grenite.Types exposing (Request, Response, RouteHandler)
+import HttpServer
+import Json.Encode as Encode
+import Shared exposing (AppModel, Error)
+import Supabase exposing (Profile, User)
+import Task exposing (Task)
+
+
+routes : Array (RouteHandler AppModel Error)
+routes =
+    Array.append
+        [ profileRoute
+        , followRoute
+        , unfollowRoute
+        ]
+        (Array.map Shared.optionsRoute [ "/api/profiles/:username", "/api/profiles/:username/follow" ])
+
+
+type alias ProfileResponse =
+    { profile : Profile
+    }
+
+
+type alias UsernameParams =
+    { username : String
+    }
+
+
+encodeProfileResponse : ProfileResponse -> Encode.Value
+encodeProfileResponse response =
+    Encode.object
+        [ { key = "profile"
+          , value =
+                Encode.object
+                    [ { key = "username", value = Encode.string response.profile.username }
+                    , { key = "bio", value = Shared.encodeMaybe Encode.string response.profile.bio }
+                    , { key = "image", value = Shared.encodeMaybe Encode.string response.profile.image }
+                    , { key = "following", value = Encode.bool response.profile.following }
+                    ]
+          }
+        ]
+
+
+profileRoute : RouteHandler AppModel Error
+profileRoute =
+    Grenite.createRoute
+        { method = HttpServer.GET
+        , route =
+            RouteParser.defineRoute
+                "/api/profiles/:username"
+                (RouteParser.succeed (\username -> { username = username })
+                    |> RouteParser.required "username" RouteParser.string
+                )
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeProfileResponse
+        , handler = profileHandler
+        }
+
+
+followRoute : RouteHandler AppModel Error
+followRoute =
+    Grenite.createRoute
+        { method = HttpServer.POST
+        , route =
+            RouteParser.defineRoute
+                "/api/profiles/:username/follow"
+                (RouteParser.succeed (\username -> { username = username })
+                    |> RouteParser.required "username" RouteParser.string
+                )
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeProfileResponse
+        , handler = followHandler
+        }
+
+
+unfollowRoute : RouteHandler AppModel Error
+unfollowRoute =
+    Grenite.createRoute
+        { method = HttpServer.DELETE
+        , route =
+            RouteParser.defineRoute
+                "/api/profiles/:username/follow"
+                (RouteParser.succeed (\username -> { username = username })
+                    |> RouteParser.required "username" RouteParser.string
+                )
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeProfileResponse
+        , handler = unfollowHandler
+        }
+
+
+profileHandler : AppModel -> Request UsernameParams Helpers.EmptyRequestBody -> Task Error (Response ProfileResponse)
+profileHandler model request =
+    Shared.optionalUser model.config (Shared.tokenFromRequest request)
+        |> Task.andThen (getProfileFor model.config request.params.username)
+        |> Task.map (\body -> { status = 200, body = body, headers = Shared.jsonHeaders })
+
+
+getProfileFor : Supabase.Config -> String -> Maybe User -> Task Error ProfileResponse
+getProfileFor config username maybeViewer =
+    Supabase.getProfile config { username = username, viewerId = Maybe.map .id maybeViewer }
+        |> Task.mapError Shared.supabaseError
+        |> Task.andThen
+            (\maybeProfile ->
+                when maybeProfile is
+                    Just profile ->
+                        Task.succeed { profile = profile }
+
+                    Nothing ->
+                        Task.fail (Shared.NotFound "profile")
+            )
+
+
+followHandler : AppModel -> Request UsernameParams Helpers.EmptyRequestBody -> Task Error (Response ProfileResponse)
+followHandler model request =
+    Shared.requireUser model.config (Shared.tokenFromRequest request)
+        |> Task.andThen
+            (\viewer ->
+                Supabase.setFollowing model.config
+                    { username = request.params.username
+                    , viewerId = viewer.id
+                    , follow = True
+                    }
+                    |> Task.mapError Shared.supabaseError
+            )
+        |> Task.map (\profile -> { status = 200, body = { profile = profile }, headers = Shared.jsonHeaders })
+
+
+unfollowHandler : AppModel -> Request UsernameParams Helpers.EmptyRequestBody -> Task Error (Response ProfileResponse)
+unfollowHandler model request =
+    Shared.requireUser model.config (Shared.tokenFromRequest request)
+        |> Task.andThen
+            (\viewer ->
+                Supabase.setFollowing model.config
+                    { username = request.params.username
+                    , viewerId = viewer.id
+                    , follow = False
+                    }
+                    |> Task.mapError Shared.supabaseError
+            )
+        |> Task.map (\profile -> { status = 200, body = { profile = profile }, headers = Shared.jsonHeaders })

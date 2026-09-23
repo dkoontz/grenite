@@ -6,6 +6,7 @@ import Grenite.Http
 import Grenite.Types exposing (Application, Request, Response, RouteConfig, RouteHandler(..))
 import HttpServer
 import HttpServer.Response as HttpResponse
+import HttpClient
 import Init
 import Json.Encode as Encode
 import Node exposing (Environment)
@@ -117,22 +118,33 @@ type Msg appError
 init : Application appModel appError -> Environment -> Init.Task { model : Model appModel appError, command : Cmd (Msg appError) }
 init application env =
     Init.await HttpServer.initialize
-        (\permission ->
-            Node.startProgram
-                { model =
-                    { application = application
-                    , appModel = application.init env
-                    , server = Nothing
-                    , stdout = env.stdout
-                    , stderr = env.stderr
-                    }
-                , command =
-                    HttpServer.createServer permission
-                        { host = application.host
-                        , port_ = application.port_
-                        }
-                        |> Task.attempt CreateServerResult
-                }
+        (\serverPermission ->
+            Init.await HttpClient.initialize
+                (\httpPermission ->
+                    Init.awaitTask Node.getEnvironmentVariables
+                        (\variables ->
+                            Node.startProgram
+                                { model =
+                                    { application = application
+                                    , appModel =
+                                        application.init
+                                            { environment = env
+                                            , httpPermission = httpPermission
+                                            , variables = variables
+                                            }
+                                    , server = Nothing
+                                    , stdout = env.stdout
+                                    , stderr = env.stderr
+                                    }
+                                , command =
+                                    HttpServer.createServer serverPermission
+                                        { host = application.host
+                                        , port_ = application.port_
+                                        }
+                                        |> Task.attempt CreateServerResult
+                                }
+                        )
+                )
         )
 
 

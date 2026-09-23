@@ -1,0 +1,16 @@
+{
+  "name": "grenite-realworld-example",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Grenite implementation of the RealWorld backend API, backed by the Supabase HTTP API (PostgREST) via Docker.",
+  "scripts": {
+    "db:up": "docker compose up -d",
+    "db:down": "docker compose down",
+    "db:clean": "docker compose down -v",
+    "db:prepare": "docker compose exec -T -e PGPASSWORD=postgres db psql -U supabase_admin -d postgres -v ON_ERROR_STOP=1 -f - < db/schema.sql && docker compose restart rest",
+    "build": "mkdir -p build && gren make Main --output=build/main.js",
+    "start": "node main.js",
+    "test": "./hurl/run-hurl-tests.sh",
+    "clean": "rm -rf build gren_packages"
+  }
+}

@@ -1,0 +1,194 @@
+module CommentsApi exposing (routes)
+
+import Array exposing (Array)
+import Grenite
+import Grenite.Helpers as Helpers
+import Grenite.RouteParser as RouteParser
+import Grenite.Types exposing (Request, Response, RouteHandler)
+import HttpServer
+import Json.Decode as Decode
+import Json.Encode as Encode
+import Ports exposing (Comment, Profile)
+import Shared exposing (AppModel, Error)
+import Task exposing (Task)
+
+
+routes : Array (RouteHandler AppModel Error)
+routes =
+    [ addCommentRoute
+    , listCommentsRoute
+    , deleteCommentRoute
+    ]
+
+
+type alias CommentParams =
+    { slug : String
+    }
+
+
+type alias DeleteCommentParams =
+    { slug : String
+    , id : Int
+    }
+
+
+type alias AddCommentBody =
+    { body : Maybe String
+    }
+
+
+type alias CommentResponse =
+    { comment : Comment
+    }
+
+
+type alias CommentsResponse =
+    { comments : Array Comment
+    }
+
+
+decodeAddCommentBody : Decode.Decoder AddCommentBody
+decodeAddCommentBody =
+    Decode.map (\body -> { body = body })
+        (Decode.field "comment" (Decode.map Shared.flatten (Shared.optionalField "body" Decode.string)))
+
+
+encodeAuthor : Profile -> Encode.Value
+encodeAuthor author =
+    Encode.object
+        [ { key = "username", value = Encode.string author.username }
+        , { key = "bio", value = Shared.encodeMaybe Encode.string author.bio }
+        , { key = "image", value = Shared.encodeMaybe Encode.string author.image }
+        , { key = "following", value = Encode.bool author.following }
+        ]
+
+
+encodeComment : Comment -> Encode.Value
+encodeComment comment =
+    Encode.object
+        [ { key = "id", value = Encode.int comment.id }
+        , { key = "createdAt", value = Encode.string comment.createdAt }
+        , { key = "updatedAt", value = Encode.string comment.updatedAt }
+        , { key = "body", value = Encode.string comment.body }
+        , { key = "author", value = encodeAuthor comment.author }
+        ]
+
+
+encodeCommentResponse : CommentResponse -> Encode.Value
+encodeCommentResponse response =
+    Encode.object
+        [ { key = "comment", value = encodeComment response.comment } ]
+
+
+encodeCommentsResponse : CommentsResponse -> Encode.Value
+encodeCommentsResponse response =
+    Encode.object
+        [ { key = "comments", value = Encode.array encodeComment response.comments } ]
+
+
+addCommentRoute : RouteHandler AppModel Error
+addCommentRoute =
+    Grenite.createRoute
+        { method = HttpServer.POST
+        , route =
+            RouteParser.defineRoute
+                "/api/articles/:slug/comments"
+                (RouteParser.succeed (\slug -> { slug = slug })
+                    |> RouteParser.required "slug" RouteParser.string
+                )
+        , requestDecoder = Helpers.jsonRequestBodyDecoder decodeAddCommentBody
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeCommentResponse
+        , handler = addCommentHandler
+        }
+
+
+listCommentsRoute : RouteHandler AppModel Error
+listCommentsRoute =
+    Grenite.createRoute
+        { method = HttpServer.GET
+        , route =
+            RouteParser.defineRoute
+                "/api/articles/:slug/comments"
+                (RouteParser.succeed (\slug -> { slug = slug })
+                    |> RouteParser.required "slug" RouteParser.string
+                )
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeCommentsResponse
+        , handler = listCommentsHandler
+        }
+
+
+deleteCommentRoute : RouteHandler AppModel Error
+deleteCommentRoute =
+    Grenite.createRoute
+        { method = HttpServer.DELETE
+        , route =
+            RouteParser.defineRoute
+                "/api/articles/:slug/comments/:id"
+                (RouteParser.succeed (\slug id -> { slug = slug, id = id })
+                    |> RouteParser.required "slug" RouteParser.string
+                    |> RouteParser.required "id" RouteParser.int
+                )
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.emptyResponseBodyEncoder
+        , handler = deleteCommentHandler
+        }
+
+
+addCommentHandler : AppModel -> Request CommentParams AddCommentBody -> Task Error (Response CommentResponse)
+addCommentHandler _ request =
+    Shared.requireUser (Shared.tokenFromRequest request)
+        |> Task.andThen (\user -> addComment user.id request.params.slug request.body)
+        |> Task.map (\comment -> { status = 201, body = { comment = comment }, headers = Shared.jsonHeaders })
+
+
+addComment : Int -> String -> AddCommentBody -> Task Error Comment
+addComment authorId slug body =
+    Shared.fromFieldErrors (Shared.blankErrors "body" body.body)
+        |> Task.andThen
+            (\_ ->
+                Ports.insertComment
+                    { slug = slug
+                    , authorId = authorId
+                    , body = Maybe.withDefault "" body.body
+                    }
+                    |> Task.mapError Shared.dbError
+            )
+
+
+listCommentsHandler : AppModel -> Request CommentParams Helpers.EmptyRequestBody -> Task Error (Response CommentsResponse)
+listCommentsHandler _ request =
+    Shared.optionalUser (Shared.tokenFromRequest request)
+        |> Task.andThen
+            (\maybeViewer ->
+                Ports.listComments { slug = request.params.slug, viewerId = Maybe.map .id maybeViewer }
+                    |> Task.mapError Shared.dbError
+            )
+        |> Task.andThen
+            (\maybeComments ->
+                when maybeComments is
+                    Just comments ->
+                        Task.succeed
+                            { status = 200
+                            , body = { comments = comments }
+                            , headers = Shared.jsonHeaders
+                            }
+
+                    Nothing ->
+                        Task.fail (Shared.NotFound "article")
+            )
+
+
+deleteCommentHandler : AppModel -> Request DeleteCommentParams Helpers.EmptyRequestBody -> Task Error (Response Helpers.EmptyResponseBody)
+deleteCommentHandler _ request =
+    Shared.requireUser (Shared.tokenFromRequest request)
+        |> Task.andThen
+            (\user ->
+                Ports.deleteComment
+                    { slug = request.params.slug
+                    , commentId = request.params.id
+                    , requesterId = user.id
+                    }
+                    |> Task.mapError Shared.dbError
+            )
+        |> Task.map (\_ -> { status = 204, body = {}, headers = Shared.corsHeaders })

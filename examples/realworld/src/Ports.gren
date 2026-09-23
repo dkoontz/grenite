@@ -1,0 +1,261 @@
+port module Ports exposing
+    ( Article
+    , ArticlePage
+    , ArticlePatch
+    , ArticleSummary
+    , ArticleUpdate
+    , Comment
+    , ListArticlesQuery
+    , Profile
+    , User
+    , UserPatch
+    , UserUpdate
+    , UserWithHash
+    , createToken
+    , deleteArticle
+    , deleteComment
+    , favoriteArticle
+    , findUserByEmail
+    , findUserById
+    , followUser
+    , getArticle
+    , getProfile
+    , hashPassword
+    , insertArticle
+    , insertComment
+    , insertUser
+    , listArticles
+    , listComments
+    , listFeed
+    , listTags
+    , unfavoriteArticle
+    , unfollowUser
+    , updateArticle
+    , updateUser
+    , verifyPassword
+    , verifyToken
+    )
+
+import Array exposing (Array)
+import Json.Decode as Decode
+import Task exposing (Task)
+
+
+{-| The wire types that cross the port boundary. They live here so that this
+module owns its contract and no import cycle arises.
+
+A `Maybe` argument field encodes to JSON `null`, and a `null` on the JS side
+decodes back to `Nothing`. Fields that mean "set this to null" versus "leave
+unchanged" therefore cannot use `Maybe` directly. The `*Patch` types solve
+this: a patch entry means "change this field", and its `value` being `Nothing`
+means "change it to null".
+-}
+
+
+type alias User =
+    { id : Int
+    , email : String
+    , username : String
+    , bio : Maybe String
+    , image : Maybe String
+    }
+
+
+type alias UserWithHash =
+    { id : Int
+    , email : String
+    , username : String
+    , bio : Maybe String
+    , image : Maybe String
+    , passwordHash : String
+    }
+
+
+type alias Profile =
+    { username : String
+    , bio : Maybe String
+    , image : Maybe String
+    , following : Bool
+    }
+
+
+type alias Article =
+    { slug : String
+    , title : String
+    , description : String
+    , body : String
+    , tagList : Array String
+    , createdAt : String
+    , updatedAt : String
+    , favorited : Bool
+    , favoritesCount : Int
+    , author : Profile
+    }
+
+
+{-| An article as returned by the list and feed endpoints. These endpoints
+omit the article `body`, so the type omits it too.
+-}
+type alias ArticleSummary =
+    { slug : String
+    , title : String
+    , description : String
+    , tagList : Array String
+    , createdAt : String
+    , updatedAt : String
+    , favorited : Bool
+    , favoritesCount : Int
+    , author : Profile
+    }
+
+
+type alias ArticlePage =
+    { articles : Array ArticleSummary
+    , count : Int
+    }
+
+
+type alias Comment =
+    { id : Int
+    , createdAt : String
+    , updatedAt : String
+    , body : String
+    , author : Profile
+    }
+
+
+type alias ListArticlesQuery =
+    { tag : Maybe String
+    , author : Maybe String
+    , favorited : Maybe String
+    , viewerId : Maybe Int
+    , limit : Int
+    , offset : Int
+    }
+
+
+type alias UserPatch =
+    { field : String
+    , value : Maybe String
+    }
+
+
+type alias UserUpdate =
+    { userId : Int
+    , patches : Array UserPatch
+    }
+
+
+type alias ArticlePatch =
+    { field : String
+    , value : Maybe String
+    }
+
+
+type alias ArticleUpdate =
+    { slug : String
+    , requesterId : Int
+    , patches : Array ArticlePatch
+    , tagList : Maybe (Array String)
+    }
+
+
+{-| Task ports: each declaration maps to an async handler registered in
+main.js. The handler name must match the port name. The argument is the
+request. The Task succeeds with the value the JS handler resolves with, and
+fails with a `Json.Decode.Value` built from the error the JS handler rejects
+with. Rejections carry `{ code, message }`, and `Shared.dbError` maps the
+code onto a typed error.
+-}
+
+
+-- Crypto and tokens (implemented with node:crypto)
+
+
+port hashPassword : String -> Task Decode.Value String
+
+
+port verifyPassword : { password : String, hash : String } -> Task Decode.Value Bool
+
+
+port createToken : { userId : Int, email : String, username : String } -> Task Decode.Value String
+
+
+port verifyToken : String -> Task Decode.Value (Maybe { userId : Int })
+
+
+
+-- Users
+
+
+port insertUser : { username : String, email : String, passwordHash : String } -> Task Decode.Value User
+
+
+port findUserByEmail : String -> Task Decode.Value (Maybe UserWithHash)
+
+
+port findUserById : Int -> Task Decode.Value (Maybe User)
+
+
+port updateUser : UserUpdate -> Task Decode.Value User
+
+
+
+-- Profiles
+
+
+port getProfile : { username : String, viewerId : Maybe Int } -> Task Decode.Value (Maybe Profile)
+
+
+port followUser : { username : String, viewerId : Int } -> Task Decode.Value Profile
+
+
+port unfollowUser : { username : String, viewerId : Int } -> Task Decode.Value Profile
+
+
+
+-- Articles
+
+
+port insertArticle : { authorId : Int, title : String, description : String, body : String, tagList : Array String } -> Task Decode.Value Article
+
+
+port getArticle : { slug : String, viewerId : Maybe Int } -> Task Decode.Value (Maybe Article)
+
+
+port listArticles : ListArticlesQuery -> Task Decode.Value ArticlePage
+
+
+port listFeed : { viewerId : Int, limit : Int, offset : Int } -> Task Decode.Value ArticlePage
+
+
+port updateArticle : ArticleUpdate -> Task Decode.Value Article
+
+
+port deleteArticle : { slug : String, requesterId : Int } -> Task Decode.Value {}
+
+
+port favoriteArticle : { slug : String, viewerId : Int } -> Task Decode.Value Article
+
+
+port unfavoriteArticle : { slug : String, viewerId : Int } -> Task Decode.Value Article
+
+
+
+-- Comments
+
+
+port insertComment : { slug : String, authorId : Int, body : String } -> Task Decode.Value Comment
+
+
+port listComments : { slug : String, viewerId : Maybe Int } -> Task Decode.Value (Maybe (Array Comment))
+
+
+port deleteComment : { slug : String, commentId : Int, requesterId : Int } -> Task Decode.Value {}
+
+
+
+-- Tags
+
+
+port listTags : {} -> Task Decode.Value (Array String)

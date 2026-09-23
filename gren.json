@@ -11,7 +11,9 @@
     "Grenite.Http",
     "Grenite.RouteParser",
     "Grenite.Helpers",
-    "Grenite.ErrorHelpers"
+    "Grenite.ErrorHelpers",
+    "Grenite.Data",
+    "Grenite.Data.Supabase"
   ],
   "gren-version": "0.6.5 <= v < 0.7.0",
   "dependencies": {
