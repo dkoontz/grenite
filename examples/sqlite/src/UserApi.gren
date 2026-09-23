@@ -1,0 +1,232 @@
+module UserApi exposing (AppModel, Error, handleError, handleNotFound, routes)
+
+import Array exposing (Array)
+import Grenite
+import Grenite.Helpers as Helpers
+import Grenite.Http as Http
+import Grenite.RouteParser as RouteParser
+import Grenite.Types exposing (Request, Response, RouteHandler)
+import HttpServer
+import Json.Decode as Decode
+import Json.Encode as Encode
+import Ports exposing (NewUser, User)
+import Task exposing (Task)
+
+
+type alias AppModel =
+    {}
+
+
+type Error
+    = DbError String
+    | ValidationError String
+    | NotFound
+
+
+routes : Array (RouteHandler AppModel Error)
+routes =
+    [ listUsersRoute, getUserRoute, createUserRoute, deleteUserRoute ]
+
+
+
+-- JSON encoders and decoders for the HTTP boundary
+
+
+encodeUser : User -> Encode.Value
+encodeUser user =
+    Encode.object
+        [ { key = "id", value = Encode.int user.id }
+        , { key = "firstName", value = Encode.string user.firstName }
+        , { key = "lastName", value = Encode.string user.lastName }
+        , { key = "email", value = Encode.string user.email }
+        ]
+
+
+decodeNewUser : Decode.Decoder NewUser
+decodeNewUser =
+    Decode.map3
+        (\firstName lastName email -> { firstName = firstName, lastName = lastName, email = email })
+        (Decode.field "firstName" Decode.string)
+        (Decode.field "lastName" Decode.string)
+        (Decode.field "email" Decode.string)
+
+
+jsonHeaders : Array Http.ResponseHeader
+jsonHeaders =
+    [ Http.ResponseContentType Http.ApplicationJson ]
+
+
+
+-- Routes
+
+
+listUsersRoute : RouteHandler AppModel Error
+listUsersRoute =
+    Grenite.createRoute
+        { method = HttpServer.GET
+        , route = RouteParser.defineRoute "/users" RouteParser.noParams
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.jsonResponseBodyEncoder (Encode.array encodeUser)
+        , handler = listUsersHandler
+        }
+
+
+getUserRoute : RouteHandler AppModel Error
+getUserRoute =
+    Grenite.createRoute
+        { method = HttpServer.GET
+        , route =
+            RouteParser.defineRoute
+                "/user/:id"
+                (RouteParser.succeed (\id -> { id = id })
+                    |> RouteParser.required "id" RouteParser.int
+                )
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeUser
+        , handler = getUserHandler
+        }
+
+
+createUserRoute : RouteHandler AppModel Error
+createUserRoute =
+    Grenite.createRoute
+        { method = HttpServer.POST
+        , route = RouteParser.defineRoute "/user" RouteParser.noParams
+        , requestDecoder = Helpers.jsonRequestBodyDecoder decodeNewUser
+        , responseEncoder = Helpers.jsonResponseBodyEncoder encodeUser
+        , handler = createUserHandler
+        }
+
+
+deleteUserRoute : RouteHandler AppModel Error
+deleteUserRoute =
+    Grenite.createRoute
+        { method = HttpServer.DELETE
+        , route =
+            RouteParser.defineRoute
+                "/user/:id"
+                (RouteParser.succeed (\id -> { id = id })
+                    |> RouteParser.required "id" RouteParser.int
+                )
+        , requestDecoder = Helpers.emptyRequestBodyDecoder
+        , responseEncoder = Helpers.emptyResponseBodyEncoder
+        , handler = deleteUserHandler
+        }
+
+
+
+-- Route handlers. Each one calls a task port from the Ports module and maps
+-- the Task onto an HTTP response.
+
+
+listUsersHandler : AppModel -> Request Helpers.NoRouteParams Helpers.EmptyRequestBody -> Task Error (Response (Array User))
+listUsersHandler _ _ =
+    Ports.listUsers {}
+        |> Task.mapError fromDbError
+        |> Task.map (\users -> { status = 200, body = users, headers = jsonHeaders })
+
+
+getUserHandler : AppModel -> Request { id : Int } Helpers.EmptyRequestBody -> Task Error (Response User)
+getUserHandler _ request =
+    if request.params.id <= 0 then
+        Task.fail (ValidationError "User ID must be positive")
+
+    else
+        Ports.findUser request.params.id
+            |> Task.mapError fromDbError
+            |> Task.andThen
+                (\maybeUser ->
+                    when maybeUser is
+                        Just user ->
+                            Task.succeed { status = 200, body = user, headers = jsonHeaders }
+
+                        Nothing ->
+                            Task.fail NotFound
+                )
+
+
+createUserHandler : AppModel -> Request Helpers.NoRouteParams NewUser -> Task Error (Response User)
+createUserHandler _ request =
+    validateNewUser request.body
+        |> Task.andThen
+            (\newUser ->
+                Ports.insertUser newUser
+                    |> Task.mapError fromDbError
+            )
+        |> Task.map (\user -> { status = 201, body = user, headers = jsonHeaders })
+
+
+validateNewUser : NewUser -> Task Error NewUser
+validateNewUser newUser =
+    if String.isEmpty newUser.firstName then
+        Task.fail (ValidationError "First name is required")
+
+    else if String.isEmpty newUser.lastName then
+        Task.fail (ValidationError "Last name is required")
+
+    else if String.isEmpty newUser.email then
+        Task.fail (ValidationError "Email is required")
+
+    else
+        Task.succeed newUser
+
+
+deleteUserHandler : AppModel -> Request { id : Int } Helpers.EmptyRequestBody -> Task Error (Response Helpers.EmptyResponseBody)
+deleteUserHandler _ request =
+    if request.params.id <= 0 then
+        Task.fail (ValidationError "User ID must be positive")
+
+    else
+        Ports.deleteUser request.params.id
+            |> Task.mapError fromDbError
+            |> Task.andThen
+                (\deletedCount ->
+                    if deletedCount > 0 then
+                        Task.succeed { status = 204, body = {}, headers = [] }
+
+                    else
+                        Task.fail NotFound
+                )
+
+
+
+-- Error handling
+
+
+{-| A failed task port gives us the raw JS error as a Json.Decode.Value.
+-}
+fromDbError : Decode.Value -> Error
+fromDbError value =
+    Decode.decodeValue (Decode.field "message" Decode.string) value
+        |> Result.withDefault "Unknown database error"
+        |> DbError
+
+
+handleError : Error -> Response String
+handleError error =
+    when error is
+        DbError message ->
+            { status = 500
+            , body = "{\"error\": \"Database Error\", \"message\": \"" ++ message ++ "\"}"
+            , headers = []
+            }
+
+        ValidationError message ->
+            { status = 422
+            , body = "{\"error\": \"Validation Failed\", \"message\": \"" ++ message ++ "\"}"
+            , headers = []
+            }
+
+        NotFound ->
+            { status = 404
+            , body = "{\"error\": \"Not Found\"}"
+            , headers = []
+            }
+
+
+handleNotFound : HttpServer.Request -> Response String
+handleNotFound _ =
+    { status = 404
+    , body = "{\"error\": \"Not Found\"}"
+    , headers = []
+    }

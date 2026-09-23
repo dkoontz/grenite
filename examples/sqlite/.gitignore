@@ -1,0 +1,6 @@
+build/
+data/
+node_modules/
+
+# The root .gitignore ignores *.js. This file is source, so re-include it.
+!main.js

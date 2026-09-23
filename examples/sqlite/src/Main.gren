@@ -1,0 +1,16 @@
+module Main exposing (main)
+
+import Grenite
+import UserApi
+
+
+main : Grenite.Server UserApi.AppModel UserApi.Error
+main =
+    Grenite.createServer
+        { host = "0.0.0.0"
+        , port_ = 3000
+        , routes = UserApi.routes
+        , notFoundHandler = UserApi.handleNotFound
+        , errorHandler = UserApi.handleError
+        , init = \_ -> {}
+        }

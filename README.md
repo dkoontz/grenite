@@ -11,6 +11,7 @@ Requirements: Gren 0.6.5 and Node.js (current LTS).
 3. Compile with `gren make Main` and run with `node app`.
 
 See `examples/basic` for a complete server.
+See `examples/sqlite` for a server that stores data in SQLite through task ports.
 
 ## Define routes
 
@@ -92,7 +93,9 @@ main =
 - Request bodies must be valid UTF-8 text, because `requestDecoder` takes a
   `String`. Binary bodies need a follow-up design.
 
-## Compile and run the example
+## Compile and run the examples
+
+### basic
 
 ```bash
 cd examples/basic
@@ -108,3 +111,17 @@ The server listens on `0.0.0.0:3000`.
 - `POST /user` with a valid body returns 201.
 - `POST /user` with an invalid body returns 400.
 - Any unknown path or method returns 404.
+
+### sqlite
+
+```bash
+cd examples/sqlite
+npm run build
+npm start
+```
+
+The build script compiles the Gren app to `build/main.js` with `--output`.
+The file `main.js` imports that build, opens a SQLite database, and registers
+one task port handler per port. The server listens on `0.0.0.0:3000`.
+
+See `examples/sqlite/README.md` for the endpoint list.

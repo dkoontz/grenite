@@ -1,0 +1,43 @@
+port module Ports exposing (NewUser, User, deleteUser, findUser, insertUser, listUsers)
+
+import Array exposing (Array)
+import Json.Decode as Decode
+import Task exposing (Task)
+
+
+-- The wire types that cross the port boundary. They live here so that this
+-- module owns its contract and no import cycle arises.
+
+
+type alias User =
+    { id : Int
+    , firstName : String
+    , lastName : String
+    , email : String
+    }
+
+
+type alias NewUser =
+    { firstName : String
+    , lastName : String
+    , email : String
+    }
+
+
+-- Task ports: each declaration maps to an async handler registered in main.js.
+-- The handler name must match the port name.
+-- The argument is the request. The Task is the response. It succeeds with the
+-- value the JS handler resolves with, and fails with a Json.Decode.Value built
+-- from the error the JS handler rejects with.
+
+
+port listUsers : {} -> Task Decode.Value (Array User)
+
+
+port findUser : Int -> Task Decode.Value (Maybe User)
+
+
+port insertUser : NewUser -> Task Decode.Value User
+
+
+port deleteUser : Int -> Task Decode.Value Int

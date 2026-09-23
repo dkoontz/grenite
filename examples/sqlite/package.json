@@ -1,0 +1,11 @@
+{
+  "name": "grenite-sqlite-example",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Grenite HTTP server that stores users in SQLite through Gren task ports.",
+  "scripts": {
+    "build": "mkdir -p build && gren make Main --output=build/main.js",
+    "start": "node main.js",
+    "clean": "rm -rf build data"
+  }
+}
