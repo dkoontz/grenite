@@ -13,7 +13,7 @@
     "Grenite.Helpers",
     "Grenite.ErrorHelpers",
     "Grenite.Data",
-    "Grenite.Data.Supabase"
+    "Grenite.Data.Postgres"
   ],
   "gren-version": "0.6.5 <= v < 0.7.0",
   "dependencies": {

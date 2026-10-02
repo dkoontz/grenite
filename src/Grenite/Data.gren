@@ -1,0 +1,425 @@
+module Grenite.Data exposing
+    ( Mapping
+    , Fields
+    , FieldSpec
+    , Storage(..)
+    , Write(..)
+    , Layout
+    , LayoutField
+    , Upgrade
+    , beginVersioned
+    , beginUnversioned
+    , field
+    , metaField
+    , finish
+    , upgradeFrom
+    , decode
+    , encode
+    , toLayout
+    )
+
+{-| The backend-neutral mapping vocabulary for the Grenite data layer.
+
+A `Mapping record` binds each field of a record to a place in storage. The
+same declaration serves three roles:
+
+  - it decodes a row into the record,
+  - it writes the record back as a row payload,
+  - it records the layout as pure data, so schema tools can diff it.
+
+`Fields record buildState` is the value under construction. It uses the same
+applicative trick as `Grenite.RouteParser`: the start stores a build
+function, and each `field` step consumes one argument of that function. A
+mapping is complete when the build state equals the record type, which
+`finish` enforces.
+
+Versioning is part of every first-party mapping. Start with
+`beginVersioned`, which stamps writes and routes old rows through the
+upgrade chain. Start with `beginUnversioned` only for sources you do not
+own, such as external tables, views, and rpc results. Backend modules such
+as `Grenite.Data.Postgres` provide the typed combinators. This module
+provides the mechanics.
+
+-}
+
+import Array exposing (Array)
+import Json.Decode as Decode
+import Json.Encode as Encode
+import Set exposing (Set)
+
+
+-- Types under construction
+
+
+{-| A mapping with fields still missing. The `buildState` type parameter
+starts as a function such as `String -> String -> Article` and shrinks to
+`Article` as fields are added.
+-}
+type Fields record buildState
+    = Fields (Parts record buildState)
+
+
+{-| A complete mapping. All fields are bound and the version chain is known.
+-}
+type Mapping record
+    = Mapping (Parts record record)
+
+
+type alias VersionInfo record =
+    { column : String
+    , current : Int
+    , history : Array (Upgrade record)
+    }
+
+
+type alias Parts record buildState =
+    { table : String
+    , versionInfo : Maybe (VersionInfo record)
+    , decodeRow : Decode.Value -> Result Decode.Error buildState
+    , writeFns : Array (record -> Write)
+    , layoutFields : Array LayoutField
+    }
+
+
+{-| One field binding, as a backend combinator supplies it. The `decodeValue`
+function receives the whole row as JSON and produces one field value. The
+`write` function receives the finished record and says how the field reaches
+storage, if it does.
+-}
+type alias FieldSpec record value =
+    { id : String
+    , storage : Storage
+    , columnType : Maybe String
+    , decodeValue : Decode.Value -> Result Decode.Error value
+    , write : record -> Write
+    }
+
+
+{-| Where a field lives in storage. Pure data: this is what a schema diff
+compares.
+-}
+type Storage
+    = KeyColumn String
+    | Column String
+    | BlobPart { column : String, key : String }
+    | ChildRows { table : String, foreignKey : String, order : Maybe String, valueColumn : String }
+    | Embedded { table : String, foreignKey : String, nested : Layout }
+    | Computed
+
+
+{-| How one field value reaches a write payload. Blob fields of one column
+are grouped into a single JSON object by `encode`.
+-}
+type Write
+    = ColumnWrite { column : String, value : Encode.Value }
+    | BlobWrite { column : String, key : String, value : Encode.Value }
+    | NoWrite
+
+
+{-| The serializable layout of a complete mapping.
+-}
+type alias Layout =
+    { table : String
+    , fields : Array LayoutField
+    , versionColumn : Maybe String
+    , currentVersion : Int
+    }
+
+
+type alias LayoutField =
+    { id : String
+    , storage : Storage
+    , columnType : Maybe String
+    }
+
+
+{-| One step of the version chain. The `decode` function reads a row stamped
+at `version` and produces the current record type, because the old mapping's
+decode and the upgrade function were composed when this value was made.
+-}
+type alias Upgrade to =
+    { version : Int
+    , decode : Decode.Value -> Result Decode.Error to
+    }
+
+
+
+-- Building
+
+
+{-| Start a versioned mapping on `table` with a build function. Writes stamp
+`column` with `current`. Reads of rows stamped below `current` decode
+through the matching history entry. A type alias has no constructor in Gren,
+so pass a named function whose parameter order matches the field order.
+-}
+beginVersioned :
+    { column : String
+    , current : Int
+    , history : Array (Upgrade record)
+    }
+    -> String
+    -> build
+    -> Fields record build
+beginVersioned versionSpec table build =
+    Fields
+        { table = table
+        , versionInfo =
+            Just
+                { column = versionSpec.column
+                , current = versionSpec.current
+                , history = versionSpec.history
+                }
+        , decodeRow = \_ -> Ok build
+        , writeFns = []
+        , layoutFields = []
+        }
+
+
+{-| Start a mapping without a version stamp. For sources you do not own:
+external tables, views, rpc results. First-party mappings always carry a
+version.
+-}
+beginUnversioned : String -> build -> Fields record build
+beginUnversioned table build =
+    Fields
+        { table = table
+        , versionInfo = Nothing
+        , decodeRow = \_ -> Ok build
+        , writeFns = []
+        , layoutFields = []
+        }
+
+
+{-| Bind one field. Consumes one argument of the build function.
+-}
+field : FieldSpec record value -> Fields record (value -> rest) -> Fields record rest
+field spec (Fields parts) =
+    Fields
+        { table = parts.table
+        , versionInfo = parts.versionInfo
+        , decodeRow =
+            \row ->
+                parts.decodeRow row
+                    |> Result.andThen (\fn -> Result.map fn (spec.decodeValue row))
+        , writeFns = Array.pushLast spec.write parts.writeFns
+        , layoutFields =
+            Array.pushLast
+                { id = spec.id
+                , storage = spec.storage
+                , columnType = spec.columnType
+                }
+                parts.layoutFields
+        }
+
+
+{-| Record a storage fact that contributes no field to the record, such as a
+serial key column.
+-}
+metaField :
+    { id : String
+    , storage : Storage
+    , columnType : Maybe String
+    }
+    -> Fields record buildState
+    -> Fields record buildState
+metaField info (Fields parts) =
+    Fields
+        { parts
+            | layoutFields =
+                Array.pushLast
+                    { id = info.id
+                    , storage = info.storage
+                    , columnType = info.columnType
+                    }
+                    parts.layoutFields
+        }
+
+
+{-| Complete a mapping. The version data was fixed at the start, so this
+only seals the field chain.
+-}
+finish : Fields record record -> Mapping record
+finish (Fields parts) =
+    Mapping parts
+
+
+{-| Turn an old mapping plus an upgrade function into one history entry.
+The old row decodes as the old record type, then the upgrade function
+produces the current type.
+-}
+upgradeFrom : Int -> Mapping old -> (old -> new) -> Upgrade new
+upgradeFrom version oldMapping upgrade =
+    { version = version
+    , decode = \row -> decode oldMapping row |> Result.map upgrade
+    }
+
+
+
+-- Reading
+
+
+{-| Decode one row into the record. The row is the JSON object the backend
+returned. If the mapping is versioned, the row's stamp picks the decode path.
+The error stays a `Decode.Error`, which carries the failing path and value.
+Call `Decode.errorToString` when you want text.
+-}
+decode : Mapping record -> Decode.Value -> Result Decode.Error record
+decode (Mapping parts) row =
+    when parts.versionInfo is
+        Nothing ->
+            parts.decodeRow row
+
+        Just info ->
+            Decode.decodeValue (Decode.maybe (Decode.field info.column Decode.int)) row
+                |> Result.andThen
+                    (\maybeStamp ->
+                        when maybeStamp is
+                            Nothing ->
+                                Err
+                                    (Decode.Failure
+                                        { message = "missing version stamp at '" ++ info.column ++ "'"
+                                        , value = row
+                                        }
+                                    )
+
+                            Just stamp ->
+                                if stamp == info.current then
+                                    parts.decodeRow row
+
+                                else
+                                    when findUpgrade stamp info.history is
+                                        Just upgrade ->
+                                            upgrade.decode row
+
+                                        Nothing ->
+                                            Err
+                                                (Decode.Failure
+                                                    { message =
+                                                        "no upgrade path from version "
+                                                            ++ String.fromInt stamp
+                                                            ++ " to "
+                                                            ++ String.fromInt info.current
+                                                            ++ " at '"
+                                                            ++ info.column
+                                                            ++ "'"
+                                                    , value = row
+                                                    }
+                                                )
+                    )
+
+
+findUpgrade : Int -> Array (Upgrade to) -> Maybe (Upgrade to)
+findUpgrade stamp history =
+    history
+        |> Array.findFirst (\upgrade -> upgrade.version == stamp)
+        |> Maybe.map .value
+
+
+
+-- Writing
+
+
+{-| Encode one record as a write payload. Column writes go straight in.
+Blob writes are grouped into one JSON object per blob column. The version
+stamp, when present, is added last. Key columns, child rows, computed fields,
+and embedded records are not written by this path. Multi-table writes go
+through the backend's function or rpc route instead.
+-}
+encode : Mapping record -> record -> Encode.Value
+encode (Mapping parts) record =
+    let
+        writes =
+            Array.map (\writeFn -> writeFn record) parts.writeFns
+
+        columnEntries =
+            writes
+                |> Array.mapAndKeepJust
+                    (\write ->
+                        when write is
+                            ColumnWrite c ->
+                                Just { key = c.column, value = c.value }
+
+                            BlobWrite _ ->
+                                Nothing
+
+                            NoWrite ->
+                                Nothing
+                    )
+
+        blobColumns =
+            Array.foldl
+                (\write columns ->
+                    when write is
+                        BlobWrite b ->
+                            Set.set b.column columns
+
+                        _ ->
+                            columns
+                )
+                Set.empty
+                writes
+
+        blobEntries =
+            blobColumns
+                |> Set.toArray
+                |> Array.map
+                    (\column ->
+                        { key = column
+                        , value =
+                            Encode.object
+                                (writes
+                                    |> Array.mapAndKeepJust
+                                        (\write ->
+                                            when write is
+                                                BlobWrite b ->
+                                                    if b.column == column then
+                                                        Just { key = b.key, value = b.value }
+
+                                                    else
+                                                        Nothing
+
+                                                _ ->
+                                                    Nothing
+                                        )
+                                )
+                        }
+                    )
+
+        stampEntries =
+            when parts.versionInfo is
+                Just info ->
+                    [ { key = info.column, value = Encode.int info.current } ]
+
+                Nothing ->
+                    []
+    in
+    Encode.object (Array.append columnEntries (Array.append blobEntries stampEntries))
+
+
+
+-- Layout
+
+
+{-| Project the pure-data layout of a mapping. This is the value a schema
+diff compares, and what a select list is generated from.
+-}
+toLayout : Mapping record -> Layout
+toLayout (Mapping parts) =
+    { table = parts.table
+    , fields = parts.layoutFields
+    , versionColumn =
+        when parts.versionInfo is
+            Just info ->
+                Just info.column
+
+            Nothing ->
+                Nothing
+    , currentVersion =
+        when parts.versionInfo is
+            Just info ->
+                info.current
+
+            Nothing ->
+                0
+    }
+

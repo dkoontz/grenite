@@ -1,0 +1,159 @@
+module Data.Article exposing
+    ( Article
+    , ArticleV2
+    , ArticleV3
+    , articleV2
+    , articleV3
+    , buildArticleV3
+    , upgradeV2toV3
+    )
+
+import Array exposing (Array)
+import Data.Profile exposing (ProfileV1, profile)
+import Grenite.Data exposing (Mapping)
+import Grenite.Data.Postgres as Pg
+
+
+
+-- The unsuffixed alias names the current type, so handler code stays stable
+-- across layout bumps. Re-point it when the fields change.
+
+
+type alias Article =
+    ArticleV3
+
+
+type alias ArticleV3 =
+    { slug : String
+    , title : String
+    , description : String
+    , body : String
+    , tagList : Array String
+    , createdAt : String
+    , updatedAt : String
+    , favorited : Bool
+    , favoritesCount : Int
+    , author : ProfileV1
+    }
+
+
+buildArticleV3 : String -> String -> String -> String -> Array String -> String -> String -> Bool -> Int -> ProfileV1 -> ArticleV3
+buildArticleV3 slug title description body tagList createdAt updatedAt favorited favoritesCount author =
+    { slug = slug
+    , title = title
+    , description = description
+    , body = body
+    , tagList = tagList
+    , createdAt = createdAt
+    , updatedAt = updatedAt
+    , favorited = favorited
+    , favoritesCount = favoritesCount
+    , author = author
+    }
+
+
+{-| The live schema in db/schema.sql: one column per scalar field, tags as
+`article_tags` rows, viewer-dependent flags from the `favorites` embed, and
+the author embedded from `users` through `author_id`.
+-}
+articleV3 : Mapping ArticleV3
+articleV3 =
+    Pg.mapping
+        { table = "articles"
+        , keys = [ Pg.key "id" Pg.Serial ]
+        , version =
+            { column = "schema_version"
+            , current = 3
+            , history = [ Pg.upgradeFrom 2 articleV2 upgradeV2toV3 ]
+            }
+        }
+        buildArticleV3
+            |> Pg.text "slug" .slug
+            |> Pg.text "title" .title
+            |> Pg.text "description" .description
+            |> Pg.text "body" .body
+            |> Pg.childRows
+                { table = "article_tags"
+                , foreignKey = "article_id"
+                , order = Just "position"
+                , valueColumn = "tag"
+                }
+                .tagList
+            |> Pg.timestamp "created_at" .createdAt
+            |> Pg.timestamp "updated_at" .updatedAt
+            |> Pg.computed "favorited" (Pg.embedFlag "favorites")
+            |> Pg.computed "favoritesCount" (Pg.embedCount "favorites")
+            |> Pg.embedded "author" { foreignKey = "author_id" } profile
+            |> Pg.finish
+
+
+{-| Version 2 stored the tags as one comma-joined text column. Version 3
+moved them to `article_tags`.
+-}
+type alias ArticleV2 =
+    { slug : String
+    , title : String
+    , description : String
+    , body : String
+    , tagsCsv : String
+    , createdAt : String
+    , updatedAt : String
+    , favorited : Bool
+    , favoritesCount : Int
+    , author : ProfileV1
+    }
+
+
+buildArticleV2 : String -> String -> String -> String -> String -> String -> String -> Bool -> Int -> ProfileV1 -> ArticleV2
+buildArticleV2 slug title description body tagsCsv createdAt updatedAt favorited favoritesCount author =
+    { slug = slug
+    , title = title
+    , description = description
+    , body = body
+    , tagsCsv = tagsCsv
+    , createdAt = createdAt
+    , updatedAt = updatedAt
+    , favorited = favorited
+    , favoritesCount = favoritesCount
+    , author = author
+    }
+
+
+articleV2 : Mapping ArticleV2
+articleV2 =
+    Pg.mapping
+        { table = "articles"
+        , keys = [ Pg.key "id" Pg.Serial ]
+        , version =
+            { column = "schema_version"
+            , current = 2
+            , history = []
+            }
+        }
+        buildArticleV2
+            |> Pg.text "slug" .slug
+            |> Pg.text "title" .title
+            |> Pg.text "description" .description
+            |> Pg.text "body" .body
+            |> Pg.text "tags_csv" .tagsCsv
+            |> Pg.timestamp "created_at" .createdAt
+            |> Pg.timestamp "updated_at" .updatedAt
+            |> Pg.computed "favorited" (Pg.embedFlag "favorites")
+            |> Pg.computed "favoritesCount" (Pg.embedCount "favorites")
+            |> Pg.embedded "author" { foreignKey = "author_id" } profile
+            |> Pg.finish
+
+
+upgradeV2toV3 : ArticleV2 -> ArticleV3
+upgradeV2toV3 old =
+    buildArticleV3
+        old.slug
+        old.title
+        old.description
+        old.body
+        (String.split "," old.tagsCsv)
+        old.createdAt
+        old.updatedAt
+        old.favorited
+        old.favoritesCount
+        old.author

@@ -1,0 +1,43 @@
+module Data.Profile exposing (ProfileV1, buildProfileV1, profile)
+
+import Grenite.Data exposing (Mapping)
+import Grenite.Data.Postgres as Pg
+
+
+type alias ProfileV1 =
+    { username : String
+    , bio : Maybe String
+    , image : Maybe String
+    , following : Bool
+    }
+
+
+buildProfileV1 : String -> Maybe String -> Maybe String -> Bool -> ProfileV1
+buildProfileV1 username bio image following =
+    { username = username
+    , bio = bio
+    , image = image
+    , following = following
+    }
+
+
+{-| The users table, as the article author embed reads it. The `following`
+flag comes from the viewer-filtered `follows` embed, so it is computed.
+-}
+profile : Mapping ProfileV1
+profile =
+    Pg.mapping
+        { table = "users"
+        , keys = [ Pg.key "id" Pg.Serial ]
+        , version =
+            { column = "schema_version"
+            , current = 1
+            , history = []
+            }
+        }
+        buildProfileV1
+        |> Pg.text "username" .username
+        |> Pg.textNullable "bio" .bio
+        |> Pg.textNullable "image" .image
+        |> Pg.computed "following" (Pg.embedFlag "follows")
+        |> Pg.finish

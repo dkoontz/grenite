@@ -1,0 +1,770 @@
+module Grenite.Data.Postgres exposing
+    ( Config
+    , Error(..)
+    , Key
+    , KeyType(..)
+    , Select
+    , blobText
+    , blobTextArray
+    , bool
+    , childRows
+    , computed
+    , config
+    , embedCount
+    , embedFlag
+    , embedded
+    , expectMany
+    , expectOne
+    , finish
+    , insert
+    , int
+    , key
+    , mapping
+    , select
+    , text
+    , textNullable
+    , timestamp
+    , upgradeFrom
+    , unversioned
+    , whereEq
+    , withEmbed
+    , withFilter
+    , withSelect
+    , withViewer
+    )
+
+{-| The Postgres backend for `Grenite.Data`.
+
+This module provides the typed field combinators for a Postgres mapping, and
+a thin read and write path over the PostgREST HTTP API, as served by
+Supabase.
+
+The mapping owns codecs and layout. The query stays hand-shaped: reads that
+need viewer context use `withViewer` or the lower-level `withEmbed` and
+`withFilter`, and multi-table writes go through your own rpc route.
+
+A mapping has two sections. The header record holds the storage facts that
+contribute no field to the record: the table, the key columns, and the
+version policy. The field chain below it holds one step per argument of the
+build function, in the same order.
+
+-}
+
+import Array exposing (Array)
+import Bytes
+import Dict exposing (Dict)
+import Grenite.Data as Data exposing
+    ( Fields
+    , Layout
+    , LayoutField
+    , Mapping
+    , Storage(..)
+    , Upgrade
+    , Write(..)
+    )
+import HttpClient
+import Json.Decode as Decode
+import Json.Encode as Encode
+import Set exposing (Set)
+import Task exposing (Task)
+import Url
+
+
+
+-- Mapping vocabulary
+
+
+{-| Start a versioned mapping. The header names the table, the key columns,
+and the version policy: writes stamp `version.column` with `version.current`,
+and reads of rows stamped below that decode through the matching history
+entry. Pass a build function whose parameter order matches the field order
+of the chain below.
+-}
+mapping :
+    { table : String
+    , keys : Array Key
+    , version :
+        { column : String
+        , current : Int
+        , history : Array (Upgrade record)
+        }
+    }
+    -> builderFn
+    -> Fields record builderFn
+mapping header builderFn =
+    Data.beginVersioned header.version header.table builderFn
+        |> applyKeys header.keys
+
+
+{-| Start a mapping without a version stamp. For sources you do not own:
+external tables, views, rpc results. First-party mappings always carry a
+version.
+-}
+unversioned :
+    { table : String
+    , keys : Array Key
+    }
+    -> builderFn
+    -> Fields record builderFn
+unversioned header builderFn =
+    Data.beginUnversioned header.table builderFn
+        |> applyKeys header.keys
+
+
+type KeyType
+    = Serial
+    | Bigserial
+
+
+{-| One key column of the mapping header, from `key`.
+-}
+type Key
+    = Key { column : String, keyType : KeyType }
+
+
+{-| Declare a generated key column for the `keys` section of a mapping
+header. It joins and embeds rows, and it contributes no field to the record.
+-}
+key : String -> KeyType -> Key
+key column type_ =
+    Key { column = column, keyType = type_ }
+
+
+applyKeys : Array Key -> Fields record buildState -> Fields record buildState
+applyKeys keys fields =
+    Array.foldl
+        (\key_ acc ->
+            when key_ is
+                Key spec ->
+                    Data.metaField
+                        { id = spec.column
+                        , storage = Data.KeyColumn spec.column
+                        , columnType = Just (keyTypeString spec.keyType)
+                        }
+                        acc
+        )
+        fields
+        keys
+
+
+keyTypeString : KeyType -> String
+keyTypeString type_ =
+    when type_ is
+        Serial ->
+            "serial"
+
+        Bigserial ->
+            "bigserial"
+
+
+{-| Bind a text column.
+-}
+text : String -> (record -> String) -> Fields record (String -> rest) -> Fields record rest
+text column accessor =
+    Data.field
+        { id = column
+        , storage = Data.Column column
+        , columnType = Just "text"
+        , decodeValue = decodeAt column Decode.string
+        , write =
+            \record ->
+                Data.ColumnWrite { column = column, value = Encode.string (accessor record) }
+        }
+
+
+{-| Bind a nullable text column.
+-}
+textNullable : String -> (record -> Maybe String) -> Fields record (Maybe String -> rest) -> Fields record rest
+textNullable column accessor =
+    Data.field
+        { id = column
+        , storage = Data.Column column
+        , columnType = Just "text"
+        , decodeValue = decodeAt column (Decode.nullable Decode.string)
+        , write =
+            \record ->
+                Data.ColumnWrite
+                    { column = column
+                    , value =
+                        when accessor record is
+                            Just value ->
+                                Encode.string value
+
+                            Nothing ->
+                                Encode.null
+                    }
+        }
+
+
+{-| Bind an integer column.
+-}
+int : String -> (record -> Int) -> Fields record (Int -> rest) -> Fields record rest
+int column accessor =
+    Data.field
+        { id = column
+        , storage = Data.Column column
+        , columnType = Just "int"
+        , decodeValue = decodeAt column Decode.int
+        , write =
+            \record ->
+                Data.ColumnWrite { column = column, value = Encode.int (accessor record) }
+        }
+
+
+{-| Bind a boolean column.
+-}
+bool : String -> (record -> Bool) -> Fields record (Bool -> rest) -> Fields record rest
+bool column accessor =
+    Data.field
+        { id = column
+        , storage = Data.Column column
+        , columnType = Just "boolean"
+        , decodeValue = decodeAt column Decode.bool
+        , write =
+            \record ->
+                Data.ColumnWrite { column = column, value = Encode.bool (accessor record) }
+        }
+
+
+{-| Bind a timestamp column. The record keeps the ISO 8601 string, as the
+PostgREST API returns it.
+-}
+timestamp : String -> (record -> String) -> Fields record (String -> rest) -> Fields record rest
+timestamp column accessor =
+    Data.field
+        { id = column
+        , storage = Data.Column column
+        , columnType = Just "timestamptz"
+        , decodeValue = decodeAt column Decode.string
+        , write =
+            \record ->
+                Data.ColumnWrite { column = column, value = Encode.string (accessor record) }
+        }
+
+
+{-| Bind a field that lives as rows of a child table, such as tags. The rows
+arrive as a PostgREST embed under `opts.table`. A missing embed decodes as an
+empty array.
+-}
+childRows :
+    { table : String
+    , foreignKey : String
+    , order : Maybe String
+    , valueColumn : String
+    }
+    -> (record -> Array String)
+    -> Fields record (Array String -> rest)
+    -> Fields record rest
+childRows opts accessor =
+    Data.field
+        { id = opts.table
+        , storage =
+            Data.ChildRows
+                { table = opts.table
+                , foreignKey = opts.foreignKey
+                , order = opts.order
+                , valueColumn = opts.valueColumn
+                }
+        , columnType = Nothing
+        , decodeValue =
+            \row ->
+                Decode.decodeValue
+                    (Decode.maybe (Decode.field opts.table (Decode.array (Decode.field opts.valueColumn Decode.string))))
+                    row
+                    |> Result.map (Maybe.withDefault [])
+        , write = \_ -> Data.NoWrite
+        }
+
+
+{-| Bind a field the backend fills during the read, such as a flag derived
+from a viewer-filtered embed. The derive function receives the whole row and
+reads the embed by name. Computed fields never enter the write payload.
+-}
+computed :
+    String
+    -> (Decode.Value -> Result Decode.Error value)
+    -> Fields record (value -> rest)
+    -> Fields record rest
+computed id derive =
+    Data.field
+        { id = id
+        , storage = Data.Computed
+        , columnType = Nothing
+        , decodeValue = derive
+        , write = \_ -> Data.NoWrite
+        }
+
+
+{-| Bind a field that holds a nested record from another table. The rows
+arrive as a PostgREST embed aliased to `id`, so the read must select it:
+`id:table(columns)`. Use `withEmbed` or a hand-shaped select for that.
+-}
+embedded :
+    String
+    -> { foreignKey : String }
+    -> Mapping nested
+    -> Fields record (nested -> rest)
+    -> Fields record rest
+embedded id opts nestedMapping =
+    let
+        nestedLayout =
+            Data.toLayout nestedMapping
+    in
+    Data.field
+        { id = id
+        , storage =
+            Data.Embedded
+                { table = nestedLayout.table
+                , foreignKey = opts.foreignKey
+                , nested = nestedLayout
+                }
+        , columnType = Nothing
+        , decodeValue =
+            \row ->
+                Decode.decodeValue (Decode.field id Decode.value) row
+                    |> Result.andThen (\value -> Data.decode nestedMapping value)
+        , write = \_ -> Data.NoWrite
+        }
+
+
+{-| Bind a text field that lives as a key inside a JSONB column. Blob fields
+of one column are written as a single JSON object.
+-}
+blobText : String -> String -> (record -> String) -> Fields record (String -> rest) -> Fields record rest
+blobText column blobKey accessor =
+    Data.field
+        { id = blobKey
+        , storage = Data.BlobPart { column = column, key = blobKey }
+        , columnType = Just "jsonb"
+        , decodeValue = decodeNested column blobKey Decode.string
+        , write =
+            \record ->
+                Data.BlobWrite { column = column, key = blobKey, value = Encode.string (accessor record) }
+        }
+
+
+{-| Bind a string-array field that lives as a key inside a JSONB column.
+-}
+blobTextArray : String -> String -> (record -> Array String) -> Fields record (Array String -> rest) -> Fields record rest
+blobTextArray column blobKey accessor =
+    Data.field
+        { id = blobKey
+        , storage = Data.BlobPart { column = column, key = blobKey }
+        , columnType = Just "jsonb"
+        , decodeValue = decodeNested column blobKey (Decode.array Decode.string)
+        , write =
+            \record ->
+                Data.BlobWrite { column = column, key = blobKey, value = Encode.array Encode.string (accessor record) }
+        }
+
+
+decodeAt : String -> Decode.Decoder value -> Decode.Value -> Result Decode.Error value
+decodeAt column decoder =
+    \row ->
+        Decode.decodeValue (Decode.field column decoder) row
+
+
+decodeNested : String -> String -> Decode.Decoder value -> Decode.Value -> Result Decode.Error value
+decodeNested column blobKey decoder =
+    \row ->
+        Decode.decodeValue (Decode.field column (Decode.field blobKey decoder)) row
+
+
+
+-- Derived fields
+
+
+{-| True when the named embed holds at least one row. False when the embed is
+absent or empty, which is what a viewer-filtered embed looks like when the
+viewer did not act.
+-}
+embedFlag : String -> Decode.Value -> Result Decode.Error Bool
+embedFlag name =
+    \row ->
+        Decode.decodeValue (Decode.maybe (Decode.field name (Decode.array Decode.value))) row
+            |> Result.map (\rows -> rows |> Maybe.withDefault [] |> Array.isEmpty |> not)
+
+
+{-| The number of rows in the named embed.
+-}
+embedCount : String -> Decode.Value -> Result Decode.Error Int
+embedCount name =
+    \row ->
+        Decode.decodeValue (Decode.maybe (Decode.field name (Decode.array Decode.value))) row
+            |> Result.map (\rows -> rows |> Maybe.withDefault [] |> Array.length)
+
+
+
+-- Completion
+
+
+finish : Fields record record -> Mapping record
+finish =
+    Data.finish
+
+
+upgradeFrom : Int -> Mapping old -> (old -> new) -> Upgrade new
+upgradeFrom =
+    Data.upgradeFrom
+
+
+
+-- Configuration
+
+
+{-| Where to reach PostgREST and how to authenticate.
+-}
+type alias Config =
+    { http : HttpClient.Permission
+    , url : String
+    , apiKey : String
+    , authorization : Maybe String
+    }
+
+
+config : HttpClient.Permission -> Dict String String -> Config
+config httpPermission variables =
+    { http = httpPermission
+    , url = Maybe.withDefault "http://127.0.0.1:3100" (Dict.get "SUPABASE_URL" variables)
+    , apiKey = Maybe.withDefault "local-dev-key" (Dict.get "SUPABASE_API_KEY" variables)
+    , authorization = Dict.get "SUPABASE_SERVICE_TOKEN" variables
+    }
+
+
+type Error
+    = Network HttpClient.Error
+    | BadResponse String
+    | DecodeFailed Decode.Error
+
+
+
+-- Reads
+
+
+{-| A read in progress. Build it with `select`, shape it with the `with*`
+functions, and run it with `expectOne` or `expectMany`.
+-}
+type Select record
+    = Select
+        { config : Config
+        , mapping : Mapping record
+        , params : Array Param
+        }
+
+
+type alias Param =
+    { key : String
+    , value : String
+    }
+
+
+param : String -> String -> Param
+param name value =
+    { key = name, value = value }
+
+
+{-| Start a read of the mapping's table. The select list comes from the
+mapping's layout.
+-}
+select : Config -> Mapping record -> Select record
+select cfg mapping_ =
+    Select
+        { config = cfg
+        , mapping = mapping_
+        , params = [ param "select" (selectList mapping_) ]
+        }
+
+
+whereEq : String -> String -> Select record -> Select record
+whereEq column value (Select s) =
+    Select
+        { s
+            | params = Array.pushLast (param column ("eq." ++ value)) s.params
+        }
+
+
+{-| Add one item to the select list, such as an embed the computed fields
+read: `withEmbed "favorites" "user_id"` becomes `favorites(user_id)`.
+-}
+withEmbed : String -> String -> Select record -> Select record
+withEmbed name inner =
+    withSelectItem (name ++ "(" ++ inner ++ ")")
+
+
+{-| Add one query parameter, such as an embed filter:
+`withFilter "favorites.user_id" ("eq." ++ id)`.
+-}
+withFilter : String -> String -> Select record -> Select record
+withFilter filterKey value (Select s) =
+    Select
+        { s
+            | params = Array.pushLast (param filterKey value) s.params
+        }
+
+
+{-| Add the viewer-dependent embeds: `favorites` filtered to the viewer.
+Without a viewer this is a no-op. The `follows` embed under a nested author
+needs a hand-shaped select, which `withSelect` covers.
+-}
+withViewer : Maybe Int -> Select record -> Select record
+withViewer viewerId select_ =
+    when viewerId is
+        Nothing ->
+            select_
+
+        Just id ->
+            select_
+                |> withEmbed "favorites" "user_id"
+                |> withFilter "favorites.user_id" ("eq." ++ String.fromInt id)
+
+
+{-| Replace the whole select list. The escape hatch for reads the generated
+list cannot express.
+-}
+withSelect : String -> Select record -> Select record
+withSelect value (Select s) =
+    Select
+        { s
+            | params =
+                Array.map
+                    (\p ->
+                        if p.key == "select" then
+                            { p | value = value }
+
+                        else
+                            p
+                    )
+                    s.params
+        }
+
+
+withSelectItem : String -> Select record -> Select record
+withSelectItem item (Select s) =
+    Select
+        { s
+            | params =
+                Array.map
+                    (\p ->
+                        if p.key == "select" then
+                            { p | value = p.value ++ "," ++ item }
+
+                        else
+                            p
+                    )
+                    s.params
+        }
+
+
+expectMany : Select record -> Task Error (Array record)
+expectMany (Select s) =
+    let
+        path =
+            "/" ++ (Data.toLayout s.mapping).table
+    in
+    getJson s.config path s.params (Decode.array Decode.value)
+        |> Task.andThen (decodeRows s.mapping)
+
+
+expectOne : Select record -> Task Error (Maybe record)
+expectOne select_ =
+    expectMany select_
+        |> Task.map (\rows -> Array.get 0 rows)
+
+
+decodeRows : Mapping record -> Array Decode.Value -> Task Error (Array record)
+decodeRows mapping_ rows =
+    rows
+        |> Array.map (Data.decode mapping_)
+        |> collectResults
+        |> Result.mapError DecodeFailed
+        |> resultToTask
+
+
+collectResults : Array (Result error value) -> Result error (Array value)
+collectResults results =
+    Array.foldr
+        (\result acc ->
+            when acc is
+                Ok values ->
+                    when result is
+                        Ok value ->
+                            Ok (Array.pushLast value values)
+
+                        Err error ->
+                            Err error
+
+                Err error ->
+                    Err error
+        )
+        (Ok [])
+        results
+
+
+resultToTask : Result error value -> Task error value
+resultToTask result =
+    when result is
+        Ok value ->
+            Task.succeed value
+
+        Err error ->
+            Task.fail error
+
+
+
+-- Select list generation
+
+
+selectList : Mapping record -> String
+selectList mapping_ =
+    let
+        layout =
+            Data.toLayout mapping_
+
+        items =
+            layout.fields
+                |> Array.map fieldSelect
+                |> Array.keepIf (\item -> item /= "")
+                |> appendVersionColumn layout.versionColumn
+    in
+    items
+        |> dedupe
+        |> String.join ","
+
+
+nestedSelect : Layout -> String
+nestedSelect layout =
+    layout.fields
+        |> Array.map fieldSelect
+        |> Array.keepIf (\item -> item /= "")
+        |> appendVersionColumn layout.versionColumn
+        |> dedupe
+        |> String.join ","
+
+
+{-| The read needs the stamp column, or a versioned decode fails on the row.
+-}
+appendVersionColumn : Maybe String -> Array String -> Array String
+appendVersionColumn maybeColumn items =
+    when maybeColumn is
+        Just column ->
+            Array.pushLast column items
+
+        Nothing ->
+            items
+
+
+fieldSelect : LayoutField -> String
+fieldSelect fieldLayout =
+    when fieldLayout.storage is
+        KeyColumn column ->
+            column
+
+        Column column ->
+            column
+
+        BlobPart blob ->
+            blob.column
+
+        ChildRows child ->
+            child.table ++ "(" ++ child.valueColumn ++ ")"
+
+        Embedded emb ->
+            fieldLayout.id ++ ":" ++ emb.table ++ "(" ++ nestedSelect emb.nested ++ ")"
+
+        Computed ->
+            ""
+
+
+dedupe : Array String -> Array String
+dedupe items =
+    Set.fromArray items |> Set.toArray
+
+
+
+-- Writes
+
+
+{-| Insert one record through the table route. The payload holds the column
+and blob writes plus the version stamp. Multi-table writes go through your
+own rpc route instead.
+-}
+insert : Config -> Mapping record -> record -> Task Error {}
+insert cfg mapping_ record =
+    let
+        path =
+            "/" ++ (Data.toLayout mapping_).table
+    in
+    postJson cfg path [ "return=minimal" ] (Data.encode mapping_ record)
+
+
+
+-- HTTP plumbing
+
+
+buildUrl : Config -> String -> Array Param -> String
+buildUrl cfg path params =
+    if Array.isEmpty params then
+        cfg.url ++ path
+
+    else
+        cfg.url
+            ++ path
+            ++ "?"
+            ++ String.join "&"
+                (Array.map
+                    (\entry -> entry.key ++ "=" ++ Url.percentEncode entry.value)
+                    params
+                )
+
+
+withApiKeys : Config -> HttpClient.RequestConfiguration a -> HttpClient.RequestConfiguration a
+withApiKeys cfg request =
+    let
+        withAuthorization =
+            when cfg.authorization is
+                Just token ->
+                    HttpClient.withHeader "Authorization" ("Bearer " ++ token) request
+
+                Nothing ->
+                    request
+    in
+    HttpClient.withHeader "apikey" cfg.apiKey withAuthorization
+
+
+getJson : Config -> String -> Array Param -> Decode.Decoder a -> Task Error a
+getJson cfg path params decoder =
+    HttpClient.get (buildUrl cfg path params)
+        |> withApiKeys cfg
+        |> HttpClient.expectJson decoder
+        |> HttpClient.send cfg.http
+        |> Task.mapError mapHttpError
+        |> Task.map .data
+
+
+postJson : Config -> String -> Array String -> Encode.Value -> Task Error {}
+postJson cfg path prefer body =
+    Array.foldl
+        (\value request -> HttpClient.withHeader "Prefer" value request)
+        (HttpClient.post (cfg.url ++ path))
+        prefer
+        |> withApiKeys cfg
+        |> HttpClient.withJsonBody body
+        |> HttpClient.expectAnything
+        |> HttpClient.send cfg.http
+        |> Task.mapError mapHttpError
+        |> Task.map (\_ -> {})
+
+
+mapHttpError : HttpClient.Error -> Error
+mapHttpError httpError =
+    when httpError is
+        HttpClient.BadStatus response ->
+            when Bytes.toString response.data is
+                Just body ->
+                    BadResponse body
+
+                Nothing ->
+                    BadResponse "the database returned an unreadable error body"
+
+        _ ->
+            Network httpError
